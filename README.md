@@ -1,32 +1,92 @@
-# React + TypeScript + Vite
+# WxCC Oracle CTI Widget
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+A headless bridge between Cisco Webex Contact Center (WxCC) Agent Desktop
+and Oracle Fusion's Media Toolbar CTI framework. It has no UI — it relays
+call events from WxCC to Oracle (`CALL_INCOMING`, `CALL_CONNECTED`,
+`CALL_HELD`, `CALL_WRAPUP`, `CALL_ENDED`, `SCREEN_POP`) and dispatches
+commands from Oracle back into WxCC (`MAKE_CALL`, `HANGUP`, `HOLD`,
+`RETRIEVE`, `SET_READY`, `SET_NOT_READY`, `COMPLETE_WRAP_UP`).
 
-Currently, two official plugins are available:
+## Architecture
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- [src/services/WxCCService.ts](src/services/WxCCService.ts) — wraps
+  `@wxcc-desktop/sdk`, maps WxCC contact events to Oracle CTI events, and
+  routes Oracle commands to WxCC SDK calls.
+- [src/services/OracleCTIService.ts](src/services/OracleCTIService.ts) —
+  sends/receives cross-origin `postMessage` traffic to Oracle Fusion.
+- [src/services/logger.ts](src/services/logger.ts) — shared logger backed
+  by `Desktop.logger`, so entries land in WxCC Desktop's own exportable
+  agent logs, not just the browser console.
+- [src/bridge.ts](src/bridge.ts) — the actual deployed entry point. No
+  React, no DOM rendering — just calls `wxcc.init()` / `oracleCTI.init()`.
+- [src/App.tsx](src/App.tsx) / [src/components/MediaToolbar.tsx](src/components/MediaToolbar.tsx) —
+  an optional visible call-control panel (Accept/Hold/Hangup), currently
+  unused by the deployed bridge but kept in case a visible panel widget is
+  wanted later. Useful today as a local dev sandbox (`npm run dev`).
 
-## React Compiler
+### Why two builds
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+`@wxcc-desktop/sdk` expects a global `window.AGENTX_SERVICE`, which the
+real WxCC Desktop host injects into its own document *before* a widget's
+script runs. That only works for scripts WxCC Desktop loads directly into
+its own page — not for content in a separately-loaded iframe, which can
+never have a global pre-seeded into it before its own scripts execute.
 
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
+So the bridge must be registered as an `agentx-custom-desktop` widget
+(script injection), not `agentx-wc-iframe`:
 
 ```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
+"headless": {
+  "id": "dw-headless",
+  "widgets": {
+    "bridge": {
+      "comp": "agentx-custom-desktop",
+      "script": "https://your-host/wxcc-oracle-bridge.js"
+    }
   },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
+  "layout": { "areas": [["bridge"]], "size": { "cols": [1], "rows": [1] } }
 }
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+## Development
+
+```bash
+npm run dev          # SPA sandbox at src/main.tsx — visual dev/testing only
+npm run build         # same SPA, for local testing/preview
+npm run build:widget  # THE deployable artifact: dist-widget/wxcc-oracle-bridge.js
+npm run lint
+```
+
+Outside a real WxCC Desktop session, `window.AGENTX_SERVICE` doesn't
+exist and the SDK throws `ReferenceError: AGENTX_SERVICE is not defined`
+at import time. [public/agentx-mock.js](public/agentx-mock.js) stubs it
+for local dev (`npm run dev`) — it's a no-op if the real global is
+already present, so it's safe to leave in. From the browser console you
+can simulate WxCC events end-to-end:
+
+```js
+__mockWxCC.fire("agentContact", "eAgentOfferContact", {
+  interactionId: "abc123", ani: "+15551234567", dnis: "100", queueName: "Support"
+})
+```
+
+## Deploying
+
+1. `npm run build:widget`
+2. Host `dist-widget/wxcc-oracle-bridge.js` somewhere WxCC Desktop can
+   reach over HTTPS.
+3. Point the `headless` widget's `script` at that URL in the desktop
+   layout JSON (see above).
+
+## Configuration
+
+`.env` (not committed — see `.gitignore`... currently it *is* tracked;
+consider moving real values to `.env.local` if this repo is ever pushed
+anywhere):
+
+- `VITE_WXCC_OUTDIAL_ENTRY_POINT` — WxCC outdial entry point ID, used by
+  the `MAKE_CALL` command handler.
+- `VITE_ORACLE_FUSION_ORIGIN` — expected origin for Oracle CTI
+  `postMessage` traffic. Leave blank only for local development; in
+  production this must be set, or any page can send this widget CTI
+  commands.
