@@ -62,12 +62,21 @@
   };
 
   // Dev helper: fire a mocked WxCC event from the browser console to
-  // exercise the app end-to-end without a real Desktop session, e.g.
+  // exercise the app end-to-end without a real Desktop session. Shape
+  // matches the real nested payload (see WxCCService.ts's
+  // extractContactInfo/WxCCContactEventDetail comment for why), so this
+  // exercises the same parsing path production traffic does:
   //
   //   __mockWxCC.fire("agentContact", "eAgentOfferContact", {
-  //     interactionId: "abc123", ani: "+15551234567", dnis: "100", queueName: "Support"
+  //     data: {
+  //       interaction: {
+  //         interactionId: "abc123",
+  //         callAssociatedDetails: { ani: "+15551234567", dn: "100", virtualTeamName: "Support" },
+  //         callAssociatedData: { Case_Number: { value: "CASE-42" } }
+  //       }
+  //     }
   //   })
-  //   __mockWxCC.fire("agentContact", "eAgentContact", { interactionId: "abc123" })
+  //   __mockWxCC.fire("agentContact", "eAgentContact", { data: { interaction: { interactionId: "abc123" } } })
   window.__mockWxCC = {
     fire: function (mod, event, detail) {
       var key = mod + "." + event;

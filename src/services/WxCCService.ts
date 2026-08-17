@@ -23,6 +23,74 @@ export interface ActiveCall {
 type StateChangeListener = (call: ActiveCall | null, state: CallState) => void;
 
 /**
+ * The SDK's shipped type declarations are broken — `@wxcc-desktop/sdk`'s
+ * package.json points event payload types at an `upstream-types.d.ts`
+ * that doesn't exist in the published package, silently masked by
+ * `skipLibCheck`. So `Service.Aqm.Contact.AgentContact` does not reflect
+ * the real runtime event shape; treat it as decorative, not load-bearing.
+ *
+ * This shape is instead confirmed against Cisco's own official sample
+ * (WebexSamples/webex-contact-center-api-samples,
+ * widget-samples/headless-crm-widget-sample/src/headless-crm-widget.js):
+ * ANI/DNIS/queue live under `data.interaction.callAssociatedDetails`, not
+ * flat on the event detail, and CAD variables live under
+ * `data.interaction.callAssociatedData`, each entry wrapped as `{ value }`.
+ */
+interface WxCCContactEventDetail {
+  interactionId?: string;
+  data?: {
+    interactionId?: string;
+    interaction?: {
+      interactionId?: string;
+      callAssociatedDetails?: {
+        ani?: string;
+        dn?: string; // DNIS
+        virtualTeamName?: string; // queue name
+      };
+      callAssociatedData?: Record<string, { value?: string } | string | undefined>;
+    };
+  };
+}
+
+interface ContactInfo {
+  interactionId: string;
+  ani: string;
+  dnis: string;
+  queueName: string;
+  callData: Record<string, string>;
+}
+
+/**
+ * Pulls interactionId/ani/dnis/queueName/callData out of a raw WxCC
+ * contact event detail. Tries the confirmed nested shape first, falls
+ * back to a flat shape in case some event type turns out to differ —
+ * cheap insurance, not a claim that the flat shape is real anywhere.
+ */
+function extractContactInfo(detail: unknown): ContactInfo {
+  const d = detail as WxCCContactEventDetail;
+  const interaction = d?.data?.interaction;
+  const details = interaction?.callAssociatedDetails;
+  const flat = detail as { ani?: string; dnis?: string; queueName?: string; callData?: Record<string, string> };
+
+  const callData: Record<string, string> = {};
+  const cad = interaction?.callAssociatedData;
+  if (cad) {
+    for (const [key, entry] of Object.entries(cad)) {
+      const value = typeof entry === "string" ? entry : entry?.value;
+      if (value !== undefined) callData[key] = value;
+    }
+  }
+
+  return {
+    interactionId: interaction?.interactionId ?? d?.data?.interactionId ?? d?.interactionId ?? "",
+    ani: details?.ani ?? flat?.ani ?? "",
+    dnis: details?.dn ?? flat?.dnis ?? "",
+    queueName: details?.virtualTeamName ?? flat?.queueName ?? "",
+    callData: Object.keys(callData).length > 0 ? callData : (flat?.callData ?? {}),
+  };
+}
+
+/**
  * Initializes the WxCC Desktop SDK, maps contact events to Oracle CTI events,
  * and routes Oracle CTI commands back to WxCC actions.
  */
@@ -67,39 +135,31 @@ class WxCCService {
 
   private registerWxCCEvents(): void {
     Desktop.agentContact.addEventListener("eAgentOfferContact", (detail: Service.Aqm.Contact.AgentContact) => {
-      const data = detail as unknown as { interactionId: string; ani: string; dnis: string; queueName: string; callData?: Record<string, string> };
+      log.debug("eAgentOfferContact raw payload", detail);
+      const info = extractContactInfo(detail);
       this.activeCall = {
-        interactionId: data.interactionId,
-        ani: data.ani ?? "",
-        dnis: data.dnis ?? "",
-        queueName: data.queueName ?? "",
-        callData: data.callData ?? {},
+        ...info,
         startedAt: new Date(),
         state: "incoming",
       };
-      log.info("eAgentOfferContact", {
-        interactionId: data.interactionId,
-        ani: data.ani,
-        dnis: data.dnis,
-        queueName: data.queueName,
-      });
+      log.info("eAgentOfferContact", info);
       oracleCTI.sendEvent("CALL_INCOMING", {
-        callId: data.interactionId,
-        ani: data.ani,
-        dnis: data.dnis,
-        queueName: data.queueName,
-        callData: data.callData,
+        callId: info.interactionId,
+        ani: info.ani,
+        dnis: info.dnis,
+        queueName: info.queueName,
+        callData: info.callData,
       });
       this.notify("incoming");
     });
 
     Desktop.agentContact.addEventListener("eAgentContact", (detail: Service.Aqm.Contact.AgentContact) => {
-      const data = detail as unknown as { interactionId: string; state?: string };
-      if (!this.activeCall || this.activeCall.interactionId !== data.interactionId) return;
+      const { interactionId } = extractContactInfo(detail);
+      if (!this.activeCall || this.activeCall.interactionId !== interactionId) return;
       this.activeCall = { ...this.activeCall, state: "connected" };
-      log.info("eAgentContact", { interactionId: data.interactionId });
+      log.info("eAgentContact", { interactionId });
       oracleCTI.sendEvent("CALL_CONNECTED", {
-        callId: data.interactionId,
+        callId: interactionId,
         ani: this.activeCall.ani,
         dnis: this.activeCall.dnis,
         callData: this.activeCall.callData,
@@ -108,33 +168,33 @@ class WxCCService {
     });
 
     Desktop.agentContact.addEventListener("eAgentContactHeld", (detail: Service.Aqm.Contact.AgentContact) => {
-      const data = detail as unknown as { interactionId: string };
+      const { interactionId } = extractContactInfo(detail);
       if (!this.activeCall) return;
       this.activeCall = { ...this.activeCall, state: "held" };
-      log.info("eAgentContactHeld", { interactionId: data.interactionId });
-      oracleCTI.sendEvent("CALL_HELD", { callId: data.interactionId });
+      log.info("eAgentContactHeld", { interactionId });
+      oracleCTI.sendEvent("CALL_HELD", { callId: interactionId });
       this.notify("held");
     });
 
     Desktop.agentContact.addEventListener("eAgentContactUnHeld", (detail: Service.Aqm.Contact.AgentContact) => {
-      const data = detail as unknown as { interactionId: string };
+      const { interactionId } = extractContactInfo(detail);
       if (!this.activeCall) return;
       this.activeCall = { ...this.activeCall, state: "connected" };
-      log.info("eAgentContactUnHeld", { interactionId: data.interactionId });
-      oracleCTI.sendEvent("CALL_RETRIEVED", { callId: data.interactionId });
+      log.info("eAgentContactUnHeld", { interactionId });
+      oracleCTI.sendEvent("CALL_RETRIEVED", { callId: interactionId });
       this.notify("connected");
     });
 
     Desktop.agentContact.addEventListener("eAgentWrapup", (detail: Service.Aqm.Contact.AgentContact) => {
-      const data = detail as unknown as { interactionId: string };
+      const { interactionId } = extractContactInfo(detail);
       if (!this.activeCall) return;
       this.activeCall = { ...this.activeCall, state: "wrapup" };
       const duration = Math.round(
         (Date.now() - this.activeCall.startedAt.getTime()) / 1000
       );
-      log.info("eAgentWrapup", { interactionId: data.interactionId, duration });
+      log.info("eAgentWrapup", { interactionId, duration });
       oracleCTI.sendEvent("CALL_WRAPUP", {
-        callId: data.interactionId,
+        callId: interactionId,
         duration,
         callData: this.activeCall.callData,
       });
@@ -142,13 +202,13 @@ class WxCCService {
     });
 
     Desktop.agentContact.addEventListener("eAgentContactEnded", (detail: Service.Aqm.Contact.AgentContact) => {
-      const data = detail as unknown as { interactionId: string };
+      const { interactionId } = extractContactInfo(detail);
       const duration = this.activeCall
         ? Math.round((Date.now() - this.activeCall.startedAt.getTime()) / 1000)
         : 0;
-      log.info("eAgentContactEnded", { interactionId: data.interactionId, duration });
+      log.info("eAgentContactEnded", { interactionId, duration });
       oracleCTI.sendEvent("CALL_ENDED", {
-        callId: data.interactionId,
+        callId: interactionId,
         duration,
       });
       this.activeCall = null;
@@ -156,6 +216,12 @@ class WxCCService {
     });
 
     Desktop.screenpop.addEventListener("eScreenPop", (detail: unknown) => {
+      log.debug("eScreenPop raw payload", detail);
+      // NOTE: unverified against a real payload — Cisco's own sample reads
+      // detail.data.screenPopName / detail.data.screenPopUrl here, not
+      // detail.callData. Left as-is since it's not what's currently
+      // broken; the raw log above will show the real shape if/when this
+      // needs fixing.
       const data = detail as { callData?: Record<string, string> };
       if (!this.activeCall) return;
       log.info("eScreenPop", { interactionId: this.activeCall.interactionId });
