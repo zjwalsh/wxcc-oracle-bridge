@@ -184,18 +184,56 @@ class WxCCService {
       this.notify("incoming");
     });
 
-    Desktop.agentContact.addEventListener("eAgentContact", (detail: Service.Aqm.Contact.AgentContact) => {
+    // Cisco's own official headless-widget sample (WebexSamples/webex-
+    // contact-center-api-samples, headless-crm-widget-sample) listens on
+    // eAgentContactAssigned for "agent connected to the call", not
+    // eAgentContact — and we've only ever confirmed eAgentContact fires at
+    // all indirectly. Listen on both and share the handler rather than
+    // gambling on one and finding out wrong a whole test cycle later; it's
+    // logged which one actually fired either way, and connectContact() is
+    // idempotent (state check) so it's harmless if both end up firing for
+    // the same call.
+    const connectContact = (source: string, detail: unknown) => {
+      log.debug(`${source} raw payload`, detail);
       const { interactionId } = extractContactInfo(detail);
-      if (!this.activeCall || this.activeCall.interactionId !== interactionId) return;
+      if (!this.activeCall) {
+        log.warn(`${source}: no active call tracked — ignoring`, { interactionId });
+        return;
+      }
+      if (this.activeCall.state === "connected") {
+        log.debug(`${source}: already connected — ignoring (likely the other of eAgentContact/eAgentContactAssigned also firing)`);
+        return;
+      }
+      if (this.activeCall.interactionId !== interactionId) {
+        // Was a silent `return` before with no logging at all — the exact
+        // kind of gap that made startCommEvent never firing invisible.
+        log.warn(`${source}: interactionId mismatch — ignoring`, {
+          fromEvent: interactionId,
+          tracked: this.activeCall.interactionId,
+        });
+        return;
+      }
       this.activeCall = { ...this.activeCall, state: "connected" };
-      log.info("eAgentContact", { interactionId });
+      log.info(source, { interactionId });
       oracleMca.startCommEvent(interactionId, toMcaInData(this.activeCall));
       this.notify("connected");
+    };
+
+    Desktop.agentContact.addEventListener("eAgentContact", (detail: Service.Aqm.Contact.AgentContact) => {
+      connectContact("eAgentContact", detail);
+    });
+
+    Desktop.agentContact.addEventListener("eAgentContactAssigned", (detail: Service.Aqm.Contact.AgentContact) => {
+      connectContact("eAgentContactAssigned", detail);
     });
 
     Desktop.agentContact.addEventListener("eAgentContactHeld", (detail: Service.Aqm.Contact.AgentContact) => {
+      log.debug("eAgentContactHeld raw payload", detail);
       const { interactionId } = extractContactInfo(detail);
-      if (!this.activeCall) return;
+      if (!this.activeCall) {
+        log.warn("eAgentContactHeld: no active call tracked — ignoring", { interactionId });
+        return;
+      }
       this.activeCall = { ...this.activeCall, state: "held" };
       log.info("eAgentContactHeld", { interactionId });
       // NOTE: no confirmed Oracle MCA call for hold/unhold state reporting
@@ -207,8 +245,12 @@ class WxCCService {
     });
 
     Desktop.agentContact.addEventListener("eAgentContactUnHeld", (detail: Service.Aqm.Contact.AgentContact) => {
+      log.debug("eAgentContactUnHeld raw payload", detail);
       const { interactionId } = extractContactInfo(detail);
-      if (!this.activeCall) return;
+      if (!this.activeCall) {
+        log.warn("eAgentContactUnHeld: no active call tracked — ignoring", { interactionId });
+        return;
+      }
       this.activeCall = { ...this.activeCall, state: "connected" };
       log.info("eAgentContactUnHeld", { interactionId });
       log.warn("Retrieve state not reported to Oracle — interactionControlStateChanged contract unverified");
@@ -216,8 +258,12 @@ class WxCCService {
     });
 
     Desktop.agentContact.addEventListener("eAgentWrapup", (detail: Service.Aqm.Contact.AgentContact) => {
+      log.debug("eAgentWrapup raw payload", detail);
       const { interactionId } = extractContactInfo(detail);
-      if (!this.activeCall) return;
+      if (!this.activeCall) {
+        log.warn("eAgentWrapup: no active call tracked — ignoring", { interactionId });
+        return;
+      }
       this.activeCall = { ...this.activeCall, state: "wrapup" };
       const duration = Math.round(
         (Date.now() - this.activeCall.startedAt.getTime()) / 1000
@@ -227,6 +273,7 @@ class WxCCService {
     });
 
     Desktop.agentContact.addEventListener("eAgentContactEnded", (detail: Service.Aqm.Contact.AgentContact) => {
+      log.debug("eAgentContactEnded raw payload", detail);
       const { interactionId } = extractContactInfo(detail);
       const duration = this.activeCall
         ? Math.round((Date.now() - this.activeCall.startedAt.getTime()) / 1000)
