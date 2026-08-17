@@ -1,6 +1,6 @@
 import { Desktop, type Service } from "@wxcc-desktop/sdk";
 import { oracleMca } from "./OracleMcaService";
-import { log } from "./logger";
+import { log, errInfo } from "./logger";
 import { MCA_ATTR } from "../types/oracle-mca";
 import type { McaAgentCommand, McaInteractionCommand } from "../types/oracle-mca";
 
@@ -134,11 +134,20 @@ class WxCCService {
       this.registerWxCCEvents();
       this.registerOracleCommands();
       log.info("WxCC Desktop SDK initialized — agent connected to widget");
+    } catch (err) {
+      log.error("WxCC Desktop SDK failed to initialize", errInfo(err));
+      throw err;
+    }
 
+    // Deliberately separate from the try/catch above: a failure loading
+    // Oracle's MCA library shouldn't be mislabeled as a WxCC SDK failure,
+    // and shouldn't make wxcc.init() itself reject — WxCC-side
+    // functionality should keep working even if the Oracle side can't
+    // load right now.
+    try {
       await oracleMca.init();
     } catch (err) {
-      log.error("WxCC Desktop SDK failed to initialize", err);
-      throw err;
+      log.error("Oracle MCA failed to initialize (WxCC SDK is still up)", errInfo(err));
     }
   }
 

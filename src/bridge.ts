@@ -1,5 +1,5 @@
 import { wxcc } from "./services/WxCCService";
-import { log } from "./services/logger";
+import { log, errInfo } from "./services/logger";
 
 /**
  * Entry point for the headless WxCC↔Oracle CTI bridge. No UI — this is
@@ -14,5 +14,5 @@ import { log } from "./services/logger";
  * (OracleMcaService) internally — see WxCCService.init().
  */
 wxcc.init().catch((err) => {
-  log.error("WxCC Desktop SDK failed to initialize", err);
+  log.error("WxCC Desktop SDK failed to initialize", errInfo(err));
 });

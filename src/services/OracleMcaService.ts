@@ -5,7 +5,7 @@ import type {
   McaToolbarApi,
 } from "../types/oracle-mca";
 import { MCA_APP_CLASSIFICATION, MCA_CHANNEL, MCA_CHANNEL_TYPE } from "../types/oracle-mca";
-import { log } from "./logger";
+import { log, errInfo } from "./logger";
 
 type InteractionCommandHandler = (cmd: McaInteractionCommand) => void | Promise<void>;
 type AgentCommandHandler = (cmd: McaAgentCommand) => void | Promise<void>;
@@ -42,7 +42,7 @@ class OracleMcaService {
     try {
       await this.loadScript(apiSource);
     } catch (err) {
-      log.error("Oracle MCA: failed to load toolbar library script", apiSource, err);
+      log.error("Oracle MCA: failed to load toolbar library script", apiSource, errInfo(err));
       return;
     }
 
@@ -97,8 +97,8 @@ class OracleMcaService {
         await this.interactionHandler(cmd);
         this.respond(cmd, "success");
       } catch (err) {
-        log.error(`Oracle interaction command ${cmd.command} handler failed`, err);
-        this.respond(cmd, "failure", String(err));
+        log.error(`Oracle interaction command ${cmd.command} handler failed`, errInfo(err));
+        this.respond(cmd, "failure", errInfo(err).message);
       }
     });
 
@@ -113,8 +113,8 @@ class OracleMcaService {
         await this.agentHandler(cmd);
         this.respond(cmd, "success");
       } catch (err) {
-        log.error(`Oracle agent command ${cmd.command} handler failed`, err);
-        this.respond(cmd, "failure", String(err));
+        log.error(`Oracle agent command ${cmd.command} handler failed`, errInfo(err));
+        this.respond(cmd, "failure", errInfo(err).message);
       }
     });
   }
