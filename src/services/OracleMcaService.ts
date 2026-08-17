@@ -147,7 +147,12 @@ class OracleMcaService {
       eventId,
       inData,
       null,
-      (res) => log.debug("newCommEvent response", res),
+      // Bumped from debug to info: this response may carry a
+      // screenPopMode field (per Oracle guidance found 2026-08-17)
+      // controlling whether Oracle treats this as an active navigation
+      // trigger vs. generic background storage — worth being sure it's
+      // visible rather than risk it being filtered at debug level.
+      (res) => log.info("newCommEvent response", res),
       MCA_CHANNEL_TYPE
     );
   }
@@ -160,7 +165,7 @@ class OracleMcaService {
       MCA_APP_CLASSIFICATION,
       eventId,
       inData,
-      (res) => log.debug("startCommEvent response", res),
+      (res) => log.info("startCommEvent response", res),
       MCA_CHANNEL_TYPE
     );
   }
@@ -174,7 +179,7 @@ class OracleMcaService {
       eventId,
       inData,
       reason,
-      (res) => log.debug("closeCommEvent response", res),
+      (res) => log.info("closeCommEvent response", res),
       MCA_CHANNEL_TYPE
     );
   }
@@ -188,7 +193,7 @@ class OracleMcaService {
       eventId,
       pageCode,
       pageData,
-      (res) => log.debug("invokeScreenPop response", res),
+      (res) => log.info("invokeScreenPop response", res),
       MCA_CHANNEL_TYPE
     );
   }

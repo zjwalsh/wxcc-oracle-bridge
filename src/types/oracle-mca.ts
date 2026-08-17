@@ -37,6 +37,10 @@ export const MCA_ATTR = {
   ANI: "SVCMCA_ANI", // confirmed: docs' newCommEvent example
   DNIS: "SVCMCA_DNIS", // UNVERIFIED — inferred from ANI's naming convention
   QUEUE: "SVCMCA_QUEUE", // UNVERIFIED
+  // IMcaStartCommInData "standard parameters" per Oracle guidance found
+  // 2026-08-17 — interactionId/channel should be explicit inData keys,
+  // not just the positional eventId/channel args to the API call itself.
+  INTERACTION_ID: "SVCMCA_INTERACTION_ID",
   SR_NUM: "SVCMCA_SR_NUM", // confirmed: docs' startCommEvent example
   CONTACT_NUMBER: "SVCMCA_CONTACT_NUMBER", // confirmed: docs' response example
   PARENT_INTERACTION_ID: "SVCMCA_PARENT_INTERACTION_ID", // confirmed: docs, transfer scenarios

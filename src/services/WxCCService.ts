@@ -1,7 +1,7 @@
 import { Desktop, type Service } from "@wxcc-desktop/sdk";
 import { oracleMca } from "./OracleMcaService";
 import { log, errInfo } from "./logger";
-import { MCA_ATTR } from "../types/oracle-mca";
+import { MCA_ATTR, MCA_CHANNEL } from "../types/oracle-mca";
 import type { McaAgentCommand, McaInteractionCommand, McaInteractionCommandName } from "../types/oracle-mca";
 
 /** Interaction commands actually wired to a WxCC action below — also reported to Oracle via getActiveInteractionCommands. */
@@ -107,6 +107,12 @@ function toMcaInData(info: ContactInfo): Record<string, string> {
     [MCA_ATTR.ANI]: info.ani,
     [MCA_ATTR.DNIS]: info.dnis,
     [MCA_ATTR.QUEUE]: info.queueName,
+    // Per Oracle guidance: IMcaStartCommInData's "standard parameters"
+    // (interactionId, channel) should be explicit inData keys, not just
+    // the positional eventId/channel args the API call already takes —
+    // possibly related to the MSI screen-pop focus failure.
+    [MCA_ATTR.INTERACTION_ID]: info.interactionId,
+    channel: MCA_CHANNEL,
   };
   // Pass CAD variables through as-is too — harmless if Oracle doesn't
   // recognize a given key, useful if it happens to match a configured token.
