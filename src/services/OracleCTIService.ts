@@ -8,6 +8,7 @@ import type {
   OracleAdapterReadyEvent,
 } from "../types/oracle-cti";
 import { ORACLE_CTI_ORIGIN } from "../types/oracle-cti";
+import { log } from "./logger";
 
 type CommandHandler = (cmd: OracleCTICommand) => void;
 
@@ -46,12 +47,18 @@ class OracleCTIService {
     const target = window.parent !== window ? window.parent : window.opener;
     if (target) {
       target.postMessage(readyMessage, ORACLE_CTI_ORIGIN);
+      log.info("Oracle CTI adapter ready — sent ADAPTER_READY", readyMessage.payload);
+    } else {
+      log.warn(
+        "Oracle CTI adapter has no parent/opener window to message — widget is not embedded in a frame, events to Oracle will be dropped"
+      );
     }
   }
 
   destroy(): void {
     window.removeEventListener("message", this.boundListener);
     this.commandHandlers.clear();
+    log.info("Oracle CTI adapter destroyed");
   }
 
   onCommand(command: OracleCommandType, handler: CommandHandler): () => void {
@@ -74,6 +81,9 @@ class OracleCTIService {
     const target = window.parent !== window ? window.parent : window.opener;
     if (target) {
       target.postMessage(message, ORACLE_CTI_ORIGIN);
+      log.info(`→ Oracle: ${event}`, payload);
+    } else {
+      log.warn(`→ Oracle: ${event} dropped — no parent/opener window`, payload);
     }
   }
 
@@ -83,13 +93,18 @@ class OracleCTIService {
       ORACLE_CTI_ORIGIN !== "*" &&
       ev.origin !== ORACLE_CTI_ORIGIN
     ) {
+      log.debug("Ignored message from unexpected origin", ev.origin);
       return;
     }
 
     const data = ev.data as OracleCTICommand;
     if (!data || data.type !== "oracle.cti.command" || !data.command) return;
 
+    log.info(`← Oracle: ${data.command}`, data.payload);
     const handlers = this.commandHandlers.get(data.command) ?? [];
+    if (handlers.length === 0) {
+      log.warn(`← Oracle: ${data.command} has no registered handler`);
+    }
     handlers.forEach((h) => h(data));
   }
 }
