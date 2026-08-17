@@ -88,12 +88,16 @@ class OracleCTIService {
   }
 
   private handleMessage(ev: MessageEvent): void {
-    // Origin validation — skip wildcard only when env var is set
+    // The widget now runs inside WxCC Desktop's own document (see
+    // src/bridge.ts), so this listener sees every postMessage in that
+    // shared window — including WxCC Desktop's own internal traffic to
+    // its other widgets/iframes. Silently ignoring anything not from
+    // Oracle is expected, normal, high-frequency behavior, not worth
+    // logging per-message.
     if (
       ORACLE_CTI_ORIGIN !== "*" &&
       ev.origin !== ORACLE_CTI_ORIGIN
     ) {
-      log.debug("Ignored message from unexpected origin", ev.origin);
       return;
     }
 

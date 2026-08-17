@@ -1,6 +1,20 @@
 // Oracle Fusion Media Toolbar CTI Adapter message protocol
 
-export const ORACLE_CTI_ORIGIN = import.meta.env.VITE_ORACLE_FUSION_ORIGIN ?? "*";
+// MessageEvent.origin is always scheme://host:port with no path — but
+// it's easy to accidentally paste a full page URL into the env var, and
+// a path-bearing value would then never match, silently dropping every
+// real message from Oracle. Normalize through URL.origin so either form
+// works.
+function resolveOracleOrigin(raw: string | undefined): string {
+  if (!raw) return "*";
+  try {
+    return new URL(raw).origin;
+  } catch {
+    return raw; // not a parseable URL — assume it's already a bare origin
+  }
+}
+
+export const ORACLE_CTI_ORIGIN = resolveOracleOrigin(import.meta.env.VITE_ORACLE_FUSION_ORIGIN);
 
 // ─── Commands received FROM Oracle Fusion ──────────────────────────────────
 
