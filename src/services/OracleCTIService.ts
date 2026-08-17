@@ -114,6 +114,12 @@ class OracleCTIService {
         "window.parent is cross-origin (not readable) — consistent with it genuinely being Oracle Fusion"
       );
     }
+    // window.parent being cross-origin doesn't mean it's the TOP window —
+    // postMessage only delivers to the exact window object it's called
+    // on, not to anything further up the chain. If there's another frame
+    // between window.parent and window.top, sending to window.parent
+    // alone would miss a listener registered at the true top.
+    log.info("window.parent === window.top?", window.parent === window.top);
   }
 
   private handleMessage(ev: MessageEvent): void {
