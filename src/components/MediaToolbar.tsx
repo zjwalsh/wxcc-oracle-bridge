@@ -1,5 +1,3 @@
-import { useEffect } from "react";
-import { oracleCTI } from "../services/OracleCTIService";
 import { wxcc } from "../services/WxCCService";
 import { useCallState } from "../hooks/useCallState";
 import type { ActiveCall, CallState } from "../services/WxCCService";
@@ -53,8 +51,9 @@ function ActionButtons({
   const handleAccept = () => call && wxcc.acceptCall(call.interactionId);
   const handleHangup = () => {
     if (!call) return;
+    // eAgentContactEnded (wired in WxCCService) reports closeCommEvent to
+    // Oracle itself — no need to call Oracle directly from here too.
     wxcc.endCall(call.interactionId);
-    oracleCTI.sendEvent("CALL_ENDED", { callId: call.interactionId });
   };
   const handleHold = () => call && wxcc.holdCall(call.interactionId);
   const handleRetrieve = () => call && wxcc.retrieveCall(call.interactionId);
@@ -114,11 +113,6 @@ function ActionButtons({
 
 export function MediaToolbar() {
   const { call, callState, isInitialized, initError } = useCallState();
-
-  useEffect(() => {
-    oracleCTI.init();
-    return () => oracleCTI.destroy();
-  }, []);
 
   if (initError) {
     return (

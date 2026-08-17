@@ -1,6 +1,8 @@
 import { Desktop, type Service } from "@wxcc-desktop/sdk";
-import { oracleCTI } from "./OracleCTIService";
+import { oracleMca } from "./OracleMcaService";
 import { log } from "./logger";
+import { MCA_ATTR } from "../types/oracle-mca";
+import type { McaAgentCommand, McaInteractionCommand } from "../types/oracle-mca";
 
 export type CallState =
   | "idle"
@@ -90,9 +92,27 @@ function extractContactInfo(detail: unknown): ContactInfo {
   };
 }
 
+/** Best-effort — see the NOTE at the eScreenPop listener for confidence level. */
+function extractScreenPopInfo(detail: unknown): { name: string; url: string } {
+  const d = detail as { data?: { screenPopName?: string; screenPopUrl?: string } };
+  return { name: d?.data?.screenPopName ?? "", url: d?.data?.screenPopUrl ?? "" };
+}
+
+/** Builds the inData object sent to Oracle's newCommEvent/startCommEvent/closeCommEvent. */
+function toMcaInData(info: ContactInfo): Record<string, string> {
+  const inData: Record<string, string> = {
+    [MCA_ATTR.ANI]: info.ani,
+    [MCA_ATTR.DNIS]: info.dnis,
+    [MCA_ATTR.QUEUE]: info.queueName,
+  };
+  // Pass CAD variables through as-is too — harmless if Oracle doesn't
+  // recognize a given key, useful if it happens to match a configured token.
+  return { ...info.callData, ...inData };
+}
+
 /**
- * Initializes the WxCC Desktop SDK, maps contact events to Oracle CTI events,
- * and routes Oracle CTI commands back to WxCC actions.
+ * Initializes the WxCC Desktop SDK, maps contact events to Oracle MCA
+ * toolbar calls, and routes Oracle MCA commands back to WxCC actions.
  */
 class WxCCService {
   private stateListeners: StateChangeListener[] = [];
@@ -114,6 +134,8 @@ class WxCCService {
       this.registerWxCCEvents();
       this.registerOracleCommands();
       log.info("WxCC Desktop SDK initialized — agent connected to widget");
+
+      await oracleMca.init();
     } catch (err) {
       log.error("WxCC Desktop SDK failed to initialize", err);
       throw err;
@@ -143,13 +165,10 @@ class WxCCService {
         state: "incoming",
       };
       log.info("eAgentOfferContact", info);
-      oracleCTI.sendEvent("CALL_INCOMING", {
-        callId: info.interactionId,
-        ani: info.ani,
-        dnis: info.dnis,
-        queueName: info.queueName,
-        callData: info.callData,
-      });
+      // newCommEvent is Oracle's mandatory first call for any communication.
+      // eventId = WxCC interactionId, consistently, so inbound commands
+      // (which echo eventId back) can be correlated to the right call.
+      oracleMca.newCommEvent(info.interactionId, toMcaInData(info));
       this.notify("incoming");
     });
 
@@ -158,12 +177,7 @@ class WxCCService {
       if (!this.activeCall || this.activeCall.interactionId !== interactionId) return;
       this.activeCall = { ...this.activeCall, state: "connected" };
       log.info("eAgentContact", { interactionId });
-      oracleCTI.sendEvent("CALL_CONNECTED", {
-        callId: interactionId,
-        ani: this.activeCall.ani,
-        dnis: this.activeCall.dnis,
-        callData: this.activeCall.callData,
-      });
+      oracleMca.startCommEvent(interactionId, toMcaInData(this.activeCall));
       this.notify("connected");
     });
 
@@ -172,7 +186,11 @@ class WxCCService {
       if (!this.activeCall) return;
       this.activeCall = { ...this.activeCall, state: "held" };
       log.info("eAgentContactHeld", { interactionId });
-      oracleCTI.sendEvent("CALL_HELD", { callId: interactionId });
+      // NOTE: no confirmed Oracle MCA call for hold/unhold state reporting
+      // — interactionControlStateChanged exists in the library's public
+      // method list but its parameter contract wasn't confirmed. Local
+      // state still updates (UI reflects it); Oracle isn't told yet.
+      log.warn("Hold state not reported to Oracle — interactionControlStateChanged contract unverified");
       this.notify("held");
     });
 
@@ -181,7 +199,7 @@ class WxCCService {
       if (!this.activeCall) return;
       this.activeCall = { ...this.activeCall, state: "connected" };
       log.info("eAgentContactUnHeld", { interactionId });
-      oracleCTI.sendEvent("CALL_RETRIEVED", { callId: interactionId });
+      log.warn("Retrieve state not reported to Oracle — interactionControlStateChanged contract unverified");
       this.notify("connected");
     });
 
@@ -193,11 +211,6 @@ class WxCCService {
         (Date.now() - this.activeCall.startedAt.getTime()) / 1000
       );
       log.info("eAgentWrapup", { interactionId, duration });
-      oracleCTI.sendEvent("CALL_WRAPUP", {
-        callId: interactionId,
-        duration,
-        callData: this.activeCall.callData,
-      });
       this.notify("wrapup");
     });
 
@@ -207,141 +220,83 @@ class WxCCService {
         ? Math.round((Date.now() - this.activeCall.startedAt.getTime()) / 1000)
         : 0;
       log.info("eAgentContactEnded", { interactionId, duration });
-      oracleCTI.sendEvent("CALL_ENDED", {
-        callId: interactionId,
-        duration,
-      });
+      // closeCommEvent is Oracle's other mandatory call — disconnects the
+      // engagement on Oracle's side.
+      oracleMca.closeCommEvent(interactionId, { duration: String(duration) });
       this.activeCall = null;
       this.notify("idle");
     });
 
     Desktop.screenpop.addEventListener("eScreenPop", (detail: unknown) => {
       log.debug("eScreenPop raw payload", detail);
-      // NOTE: unverified against a real payload — Cisco's own sample reads
-      // detail.data.screenPopName / detail.data.screenPopUrl here, not
-      // detail.callData. Left as-is since it's not what's currently
-      // broken; the raw log above will show the real shape if/when this
-      // needs fixing.
-      const data = detail as { callData?: Record<string, string> };
       if (!this.activeCall) return;
-      log.info("eScreenPop", { interactionId: this.activeCall.interactionId });
-      oracleCTI.sendEvent("SCREEN_POP", {
-        callId: this.activeCall.interactionId,
-        ani: this.activeCall.ani,
-        dnis: this.activeCall.dnis,
-        callData: { ...this.activeCall.callData, ...(data.callData ?? {}) },
-      });
+      // NOTE: field names (screenPopName/screenPopUrl) are best-effort,
+      // taken from a Cisco sample rather than confirmed against a live
+      // payload — check the raw log above if screen pops don't land.
+      const { name, url } = extractScreenPopInfo(detail);
+      log.info("eScreenPop", { interactionId: this.activeCall.interactionId, name, url });
+      oracleMca.invokeScreenPop(this.activeCall.interactionId, name, { url });
     });
   }
 
   // ─── Oracle → WxCC ────────────────────────────────────────────────────────
 
   private registerOracleCommands(): void {
-    oracleCTI.onCommand("MAKE_CALL", async (cmd) => {
-      const payload = cmd.payload as { phoneNumber: string };
-      if (!payload?.phoneNumber) {
-        log.warn("MAKE_CALL command missing phoneNumber", cmd.payload);
-        return;
+    oracleMca.onInteractionCommand(async (cmd: McaInteractionCommand) => {
+      const interactionId = cmd.eventId ?? this.activeCall?.interactionId;
+      if (!interactionId) {
+        throw new Error(`${cmd.command}: no interactionId (missing eventId and no active call)`);
       }
-      try {
-        await Desktop.dialer.startOutdial({
-          data: {
-            entryPointId: import.meta.env.VITE_WXCC_OUTDIAL_ENTRY_POINT ?? "",
-            outboundDn: payload.phoneNumber,
-          } as unknown as Service.Aqm.Dialer.tasks,
-        });
-        log.info("MAKE_CALL dispatched to WxCC", { phoneNumber: payload.phoneNumber });
-      } catch (err) {
-        log.error("MAKE_CALL failed", err);
+
+      switch (cmd.command) {
+        case "accept":
+          await Desktop.agentContact.accept({ interactionId });
+          return;
+        case "reject":
+        case "disconnect":
+          await Desktop.agentContact.end({ interactionId });
+          return;
+        case "hold":
+          await Desktop.agentContact.hold({
+            interactionId,
+            isPostCallConsult: false,
+            data: { mediaResourceId: interactionId },
+          });
+          return;
+        case "unhold":
+          await Desktop.agentContact.unHold({
+            interactionId,
+            isPostCallConsult: false,
+            data: { mediaResourceId: interactionId },
+          });
+          return;
+        case "setActive":
+        case "mute":
+        case "unmute":
+        case "record":
+        case "stopRecord":
+        case "transfer":
+          throw new Error(`${cmd.command}: not implemented yet`);
+        default:
+          throw new Error(`Unrecognized interaction command: ${cmd.command}`);
       }
     });
 
-    oracleCTI.onCommand("HANGUP", async () => {
-      if (!this.activeCall) {
-        log.warn("HANGUP received with no active call");
-        return;
-      }
-      try {
-        await Desktop.agentContact.end({ interactionId: this.activeCall.interactionId });
-        log.info("HANGUP dispatched to WxCC", { interactionId: this.activeCall.interactionId });
-      } catch (err) {
-        log.error("HANGUP failed", err);
-      }
-    });
-
-    oracleCTI.onCommand("HOLD", async () => {
-      if (!this.activeCall) {
-        log.warn("HOLD received with no active call");
-        return;
-      }
-      const call = this.activeCall;
-      try {
-        await Desktop.agentContact.hold({
-          interactionId: call.interactionId,
-          isPostCallConsult: false,
-          data: { mediaResourceId: call.interactionId },
-        });
-        log.info("HOLD dispatched to WxCC", { interactionId: call.interactionId });
-      } catch (err) {
-        log.error("HOLD failed", err);
-      }
-    });
-
-    oracleCTI.onCommand("RETRIEVE", async () => {
-      if (!this.activeCall) {
-        log.warn("RETRIEVE received with no active call");
-        return;
-      }
-      const call = this.activeCall;
-      try {
-        await Desktop.agentContact.unHold({
-          interactionId: call.interactionId,
-          isPostCallConsult: false,
-          data: { mediaResourceId: call.interactionId },
-        });
-        log.info("RETRIEVE dispatched to WxCC", { interactionId: call.interactionId });
-      } catch (err) {
-        log.error("RETRIEVE failed", err);
-      }
-    });
-
-    oracleCTI.onCommand("SET_READY", async () => {
-      try {
-        await Desktop.agentStateInfo.stateChange({
-          state: "Available",
-          auxCodeIdArray: "0",
-        });
-        log.info("SET_READY dispatched to WxCC");
-      } catch (err) {
-        log.error("SET_READY failed", err);
-      }
-    });
-
-    oracleCTI.onCommand("SET_NOT_READY", async () => {
-      try {
-        await Desktop.agentStateInfo.stateChange({
-          state: "Idle",
-          auxCodeIdArray: "0",
-        });
-        log.info("SET_NOT_READY dispatched to WxCC");
-      } catch (err) {
-        log.error("SET_NOT_READY failed", err);
-      }
-    });
-
-    oracleCTI.onCommand("COMPLETE_WRAP_UP", async () => {
-      if (!this.activeCall) {
-        log.warn("COMPLETE_WRAP_UP received with no active call");
-        return;
-      }
-      try {
-        await Desktop.agentContact.wrapup({
-          interactionId: this.activeCall.interactionId,
-          data: { wrapUpReason: "", auxCodeId: "0", isAutoWrapup: false },
-        });
-        log.info("COMPLETE_WRAP_UP dispatched to WxCC", { interactionId: this.activeCall.interactionId });
-      } catch (err) {
-        log.error("COMPLETE_WRAP_UP failed", err);
+    oracleMca.onAgentCommand(async (cmd: McaAgentCommand) => {
+      switch (cmd.command) {
+        case "makeAvailable":
+          await Desktop.agentStateInfo.stateChange({ state: "Available", auxCodeIdArray: "0" });
+          return;
+        case "makeUnavailable":
+          await Desktop.agentStateInfo.stateChange({ state: "Idle", auxCodeIdArray: "0" });
+          return;
+        case "getCurrentAgentState":
+        case "getActiveEngagements":
+        case "getActiveInteractionCommands":
+        case "custom":
+          throw new Error(`${cmd.command}: not implemented yet`);
+        default:
+          throw new Error(`Unrecognized agent command: ${cmd.command}`);
       }
     });
   }

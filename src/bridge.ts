@@ -1,5 +1,4 @@
 import { wxcc } from "./services/WxCCService";
-import { oracleCTI } from "./services/OracleCTIService";
 import { log } from "./services/logger";
 
 /**
@@ -10,8 +9,10 @@ import { log } from "./services/logger";
  * not exist inside a separately-loaded iframe). Build with
  * `npm run build:widget` and point the desktop layout's headless widget
  * `script` at the resulting single-file bundle.
+ *
+ * wxcc.init() also initializes the Oracle MCA toolbar connection
+ * (OracleMcaService) internally — see WxCCService.init().
  */
-oracleCTI.init();
 wxcc.init().catch((err) => {
   log.error("WxCC Desktop SDK failed to initialize", err);
 });
