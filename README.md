@@ -53,9 +53,17 @@ So the bridge must be registered as an `agentx-custom-desktop` widget
 ```bash
 npm run dev          # SPA sandbox at src/main.tsx — visual dev/testing only
 npm run build         # same SPA, for local testing/preview
-npm run build:widget  # THE deployable artifact: dist-widget/wxcc-oracle-bridge.js
+npm run build:widget  # THE deployable artifact: public/wxcc-oracle-bridge.js
 npm run lint
 ```
+
+`build:widget` outputs into `public/` (not a separate directory) *on
+purpose*: `npm run dev` serves `public/` directly, so once you've built
+it, `/wxcc-oracle-bridge.js` is immediately reachable at whatever URL
+you're already tunneling `npm run dev` through — no separate static
+file server needed for local testing. It's git-ignored (build output,
+not source) — rebuild it any time `bridge.ts` or the services it uses
+change; the running dev server picks up the new file without a restart.
 
 Outside a real WxCC Desktop session, `window.AGENTX_SERVICE` doesn't
 exist and the SDK throws `ReferenceError: AGENTX_SERVICE is not defined`
@@ -72,11 +80,13 @@ __mockWxCC.fire("agentContact", "eAgentOfferContact", {
 
 ## Deploying
 
-1. `npm run build:widget`
-2. Host `dist-widget/wxcc-oracle-bridge.js` somewhere WxCC Desktop can
-   reach over HTTPS.
-3. Point the `headless` widget's `script` at that URL in the desktop
-   layout JSON (see above).
+- **Testing against a real Desktop session**: `npm run build:widget`,
+  keep `npm run dev` running and reachable over HTTPS (e.g. via
+  `tailscale serve`), and point the layout's `script` at
+  `https://<your-tunnel-host>/wxcc-oracle-bridge.js`.
+- **Real deployment**: take `public/wxcc-oracle-bridge.js` (or the copy
+  under `dist/` after `npm run build`) and host it wherever WxCC Desktop
+  can reach it over HTTPS — a CDN, same as Cisco's own CRM connectors.
 
 ## Configuration
 

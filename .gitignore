@@ -9,9 +9,11 @@ lerna-debug.log*
 
 node_modules
 dist
-dist-widget
 dist-ssr
 *.local
+
+# Widget bundle is built output (npm run build:widget), not source
+public/wxcc-oracle-bridge.js
 
 # Editor directories and files
 .vscode/*
