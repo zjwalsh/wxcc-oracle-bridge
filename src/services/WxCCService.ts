@@ -296,6 +296,31 @@ class WxCCService {
       log.info("eScreenPop", { interactionId: this.activeCall.interactionId, name, url });
       oracleMca.invokeScreenPop(this.activeCall.interactionId, name, { url });
     });
+
+    // Diagnostic-only sniffer: the SDK's own type declarations are broken
+    // (confirmed earlier — points at a non-existent upstream-types.d.ts),
+    // so there's no authoritative event list to check WebRTC call-connect
+    // behavior against. Rather than guess event names one at a time,
+    // listen for every other plausible contact-lifecycle event so
+    // whichever one actually fires on a WebRTC accept shows up directly
+    // instead of requiring another blind guess. Not wired to any Oracle
+    // call yet — once we know which event actually fires, move it up into
+    // a real handler above.
+    const DIAGNOSTIC_EVENTS = [
+      "eAgentOfferContactRona",
+      "eAgentOfferConsult",
+      "eAgentContactWrappedUp",
+      "eAgentContactAniUpdated",
+      "eCallRecordingStarted",
+      "eContactOwnerChanged",
+      "eAgentConsultCreated",
+      "eAgentConsulting",
+    ] as const;
+    DIAGNOSTIC_EVENTS.forEach((eventName) => {
+      Desktop.agentContact.addEventListener(eventName, (detail: unknown) => {
+        log.info(`[diagnostic] ${eventName} fired`, detail);
+      });
+    });
   }
 
   // ─── Oracle → WxCC ────────────────────────────────────────────────────────
