@@ -125,17 +125,15 @@ class OracleMcaService {
     });
   }
 
-  /**
-   * result/resultDisplayString values are UNVERIFIED against Oracle's real
-   * contract (the library source shows only that `result` starts as the
-   * placeholder "needsSetByToolbar" and must be set before calling
-   * sendResponse — not what values it checks for). "success"/"failure" is
-   * a reasonable guess pending confirmation.
-   */
   private respond(cmd: McaInteractionCommand | McaAgentCommand, result: McaResult, detail?: string): void {
     cmd.result = result;
     if (detail) cmd.resultDisplayString = detail;
-    cmd.sendResponse();
+    // Oracle's response handlers (interactionCommandResponse/
+    // agentCommandResponse in the library source) take the command as an
+    // explicit parameter, not via `this` — calling cmd.sendResponse()
+    // with no argument passes `undefined` and throws inside their code.
+    // Confirmed against Oracle's own doc example: command.sendResponse(command).
+    cmd.sendResponse(cmd);
   }
 
   // ─── WxCC → Oracle ────────────────────────────────────────────────────────

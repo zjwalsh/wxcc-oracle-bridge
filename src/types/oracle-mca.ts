@@ -71,7 +71,11 @@ export type McaAgentCommandName =
   | "getActiveInteractionCommands"
   | "custom";
 
-/** result/response contract is UNVERIFIED — "success"/"failure" is a reasonable guess, not confirmed text from Oracle's docs. */
+/**
+ * "success" confirmed from Oracle's own onToolbarInteractionCommand doc
+ * example (`command.result = 'success';`). "failure" is not documented
+ * anywhere reachable — a reasonable guess, not confirmed text.
+ */
 export type McaResult = "success" | "failure";
 
 interface McaCommandBase {
@@ -81,8 +85,10 @@ interface McaCommandBase {
   inData?: Record<string, string>;
   result: string;
   resultDisplayString?: string;
-  outData?: Record<string, string>;
-  sendResponse: () => void;
+  /** Not string-only — e.g. getActiveInteractionCommands expects arrays (see McaAgentCommandName). */
+  outData?: Record<string, unknown>;
+  /** Must be called as `cmd.sendResponse(cmd)` — Oracle's handler reads its `command` param, not `this`. */
+  sendResponse: (cmd: unknown) => void;
 }
 
 export interface McaInteractionCommand extends McaCommandBase {

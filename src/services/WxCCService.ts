@@ -2,7 +2,10 @@ import { Desktop, type Service } from "@wxcc-desktop/sdk";
 import { oracleMca } from "./OracleMcaService";
 import { log, errInfo } from "./logger";
 import { MCA_ATTR } from "../types/oracle-mca";
-import type { McaAgentCommand, McaInteractionCommand } from "../types/oracle-mca";
+import type { McaAgentCommand, McaInteractionCommand, McaInteractionCommandName } from "../types/oracle-mca";
+
+/** Interaction commands actually wired to a WxCC action below — also reported to Oracle via getActiveInteractionCommands. */
+const SUPPORTED_INTERACTION_COMMANDS: McaInteractionCommandName[] = ["accept", "reject", "disconnect", "hold", "unhold"];
 
 export type CallState =
   | "idle"
@@ -299,9 +302,19 @@ class WxCCService {
         case "makeUnavailable":
           await Desktop.agentStateInfo.stateChange({ state: "Idle", auxCodeIdArray: "0" });
           return;
+        case "getActiveInteractionCommands":
+          // Confirmed shape from Oracle's docs: outData.supportedCommands
+          // (array) / outData.supportedFeatures (array of {name, isEnabled}).
+          // Oracle likely uses this to decide which call-control buttons
+          // to show/enable in its own UI, so answering accurately matters
+          // more than most of the other not-implemented cases here.
+          cmd.outData = {
+            supportedCommands: SUPPORTED_INTERACTION_COMMANDS,
+            supportedFeatures: [],
+          };
+          return;
         case "getCurrentAgentState":
         case "getActiveEngagements":
-        case "getActiveInteractionCommands":
         case "custom":
           throw new Error(`${cmd.command}: not implemented yet`);
         default:
