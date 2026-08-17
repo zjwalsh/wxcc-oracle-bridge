@@ -39,6 +39,7 @@ class OracleCTIService {
 
   init(): void {
     window.addEventListener("message", this.boundListener);
+    this.logFrameTopology();
     const readyMessage: OracleAdapterReadyEvent = {
       type: "oracle.cti.event",
       event: "ADAPTER_READY",
@@ -84,6 +85,34 @@ class OracleCTIService {
       log.info(`→ Oracle: ${event}`, payload);
     } else {
       log.warn(`→ Oracle: ${event} dropped — no parent/opener window`, payload);
+    }
+  }
+
+  /**
+   * postMessage has no delivery confirmation — a successful `→ Oracle:`
+   * log line only proves the call was made, not that Oracle received it.
+   * If window.parent turns out to be same-origin as us (readable), it's
+   * almost certainly WxCC Desktop's own window, not Oracle Fusion — the
+   * widget now runs inside Desktop's document, so there may be another
+   * frame layer between here and Oracle that this code doesn't know
+   * about. Cross-origin (unreadable) is consistent with window.parent
+   * genuinely being Oracle Fusion, as intended.
+   */
+  private logFrameTopology(): void {
+    if (window.parent === window) {
+      log.info("No parent frame (window.parent === window) — top-level window");
+      return;
+    }
+    try {
+      const href = window.parent.location.href;
+      log.warn(
+        "window.parent is SAME-ORIGIN and readable — this is likely WxCC Desktop's own window, not Oracle Fusion. Events sent via window.parent may not be reaching Oracle at all.",
+        href
+      );
+    } catch {
+      log.info(
+        "window.parent is cross-origin (not readable) — consistent with it genuinely being Oracle Fusion"
+      );
     }
   }
 
