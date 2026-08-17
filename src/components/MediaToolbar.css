@@ -1,0 +1,133 @@
+:root {
+  --color-idle:      #22c55e;
+  --color-incoming:  #f59e0b;
+  --color-connected: #3b82f6;
+  --color-held:      #a855f7;
+  --color-wrapup:    #06b6d4;
+  --color-error:     #ef4444;
+
+  --bg:        #1e2130;
+  --bg-surface: #262b3d;
+  --text:      #e2e8f0;
+  --text-muted: #94a3b8;
+  --border:    #334155;
+  --radius:    6px;
+  --font:      system-ui, -apple-system, sans-serif;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 13px;
+  height: 44px;
+  border-top: 1px solid var(--border);
+  box-sizing: border-box;
+  width: 100%;
+}
+
+.toolbar--loading,
+.toolbar--error {
+  justify-content: center;
+}
+
+/* ─── Status indicator ─────────────────────────────────────── */
+.toolbar-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-label {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* ─── Call details ─────────────────────────────────────────── */
+.call-details {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  overflow: hidden;
+}
+
+.call-ani {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.call-dnis,
+.call-queue {
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.call-dnis::before { content: "→ "; }
+.call-queue::before { content: "| "; }
+
+.call-duration {
+  font-family: "SF Mono", "Fira Code", monospace;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+/* ─── Action buttons ───────────────────────────────────────── */
+.action-buttons {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.btn {
+  padding: 4px 12px;
+  border: none;
+  border-radius: var(--radius);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter 0.15s;
+}
+
+.btn:hover { filter: brightness(1.15); }
+.btn:active { filter: brightness(0.9); }
+
+.btn-accept   { background: var(--color-idle);      color: #fff; }
+.btn-decline,
+.btn-hangup   { background: var(--color-error);     color: #fff; }
+.btn-hold     { background: var(--color-held);      color: #fff; }
+.btn-retrieve { background: var(--color-connected); color: #fff; }
+.btn-wrapup   { background: var(--color-wrapup);    color: #fff; }
+
+/* ─── Spinner ──────────────────────────────────────────────── */
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--border);
+  border-top-color: var(--color-connected);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
