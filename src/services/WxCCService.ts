@@ -195,18 +195,29 @@ class WxCCService {
     // the same call.
     const connectContact = (source: string, detail: unknown) => {
       log.debug(`${source} raw payload`, detail);
-      const { interactionId } = extractContactInfo(detail);
+      const { interactionId: fromEvent } = extractContactInfo(detail);
       if (!this.activeCall) {
-        log.warn(`${source}: no active call tracked — ignoring`, { interactionId });
+        log.warn(`${source}: no active call tracked — ignoring`, { interactionId: fromEvent });
         return;
       }
       if (this.activeCall.state === "connected") {
-        log.debug(`${source}: already connected — ignoring (likely the other of eAgentContact/eAgentContactAssigned also firing)`);
+        log.debug(`${source}: already connected — ignoring (likely another connect-signal event also firing for the same call)`);
         return;
       }
-      if (this.activeCall.interactionId !== interactionId) {
-        // Was a silent `return` before with no logging at all — the exact
-        // kind of gap that made startCommEvent never firing invisible.
+      let interactionId = fromEvent;
+      if (!interactionId) {
+        // Some connect-signal events (e.g. eCallRecordingStarted, used as
+        // a proxy for "connected" on WebRTC calls where the usual events
+        // never fire — see below) haven't had their exact payload shape
+        // confirmed. Fall back to the one call we're tracking rather than
+        // reject outright — was a silent `return` before with no logging
+        // at all, the exact kind of gap that made startCommEvent never
+        // firing invisible last time.
+        log.debug(`${source}: no interactionId in payload — falling back to tracked call`, {
+          tracked: this.activeCall.interactionId,
+        });
+        interactionId = this.activeCall.interactionId;
+      } else if (this.activeCall.interactionId !== interactionId) {
         log.warn(`${source}: interactionId mismatch — ignoring`, {
           fromEvent: interactionId,
           tracked: this.activeCall.interactionId,
@@ -225,6 +236,19 @@ class WxCCService {
 
     Desktop.agentContact.addEventListener("eAgentContactAssigned", (detail: Service.Aqm.Contact.AgentContact) => {
       connectContact("eAgentContactAssigned", detail);
+    });
+
+    // Confirmed by testing: for WebRTC calls in this environment, neither
+    // eAgentContact nor eAgentContactAssigned fires at all (verified via a
+    // wide diagnostic sniffer across every other plausible contact-
+    // lifecycle event) — eCallRecordingStarted was the only one that did.
+    // Using it as the de facto "connected" signal since recording
+    // typically starts right when a call connects. Caveat: if recording
+    // is ever disabled for some call/queue in this org, that call would
+    // never trigger startCommEvent — worth revisiting if that turns out
+    // to matter.
+    Desktop.agentContact.addEventListener("eCallRecordingStarted", (detail: unknown) => {
+      connectContact("eCallRecordingStarted", detail);
     });
 
     Desktop.agentContact.addEventListener("eAgentContactHeld", (detail: Service.Aqm.Contact.AgentContact) => {
@@ -272,12 +296,42 @@ class WxCCService {
       this.notify("wrapup");
     });
 
+    // Confirmed by testing: this environment uses agent wrap-up, and
+    // eAgentContactEnded never fires — eAgentContactWrappedUp (fired once
+    // the agent completes wrap-up) is the real end-of-call signal here,
+    // matching Cisco's own official headless-widget sample, which reads
+    // full ANI/DNIS/queue/CAD data from this exact event rather than
+    // eAgentContactEnded. This is where closeCommEvent — Oracle's other
+    // mandatory call — actually needs to fire for this org.
+    Desktop.agentContact.addEventListener("eAgentContactWrappedUp", (detail: unknown) => {
+      log.debug("eAgentContactWrappedUp raw payload", detail);
+      const info = extractContactInfo(detail);
+      if (!this.activeCall) {
+        log.warn("eAgentContactWrappedUp: no active call tracked — ignoring", { interactionId: info.interactionId });
+        return;
+      }
+      const interactionId = info.interactionId || this.activeCall.interactionId;
+      const duration = Math.round((Date.now() - this.activeCall.startedAt.getTime()) / 1000);
+      log.info("eAgentContactWrappedUp", { interactionId, duration });
+      oracleMca.closeCommEvent(interactionId, { ...toMcaInData(this.activeCall), duration: String(duration) });
+      this.activeCall = null;
+      this.notify("idle");
+    });
+
     Desktop.agentContact.addEventListener("eAgentContactEnded", (detail: Service.Aqm.Contact.AgentContact) => {
       log.debug("eAgentContactEnded raw payload", detail);
       const { interactionId } = extractContactInfo(detail);
-      const duration = this.activeCall
-        ? Math.round((Date.now() - this.activeCall.startedAt.getTime()) / 1000)
-        : 0;
+      if (!this.activeCall) {
+        // Expected in this org — closeCommEvent already went out from
+        // eAgentContactWrappedUp above. Guarded so this can't double-fire
+        // closeCommEvent for the same eventId if this event ever does end
+        // up firing in some other scenario (e.g. a declined/never-
+        // connected call, which wouldn't go through wrap-up at all).
+        log.info("eAgentContactEnded: no active call — already handled (e.g. via wrap-up)", { interactionId });
+        this.notify("idle");
+        return;
+      }
+      const duration = Math.round((Date.now() - this.activeCall.startedAt.getTime()) / 1000);
       log.info("eAgentContactEnded", { interactionId, duration });
       // closeCommEvent is Oracle's other mandatory call — disconnects the
       // engagement on Oracle's side.
@@ -297,21 +351,18 @@ class WxCCService {
       oracleMca.invokeScreenPop(this.activeCall.interactionId, name, { url });
     });
 
-    // Diagnostic-only sniffer: the SDK's own type declarations are broken
-    // (confirmed earlier — points at a non-existent upstream-types.d.ts),
-    // so there's no authoritative event list to check WebRTC call-connect
-    // behavior against. Rather than guess event names one at a time,
-    // listen for every other plausible contact-lifecycle event so
-    // whichever one actually fires on a WebRTC accept shows up directly
-    // instead of requiring another blind guess. Not wired to any Oracle
-    // call yet — once we know which event actually fires, move it up into
-    // a real handler above.
+    // Diagnostic-only sniffer, kept for whatever comes up next
+    // (consult/transfer scenarios etc.) — the SDK's own type declarations
+    // are broken (confirmed earlier — points at a non-existent
+    // upstream-types.d.ts), so there's no authoritative event list to
+    // check behavior against; this logs raw payloads for plausible events
+    // that aren't wired to any Oracle call yet. eAgentContactWrappedUp and
+    // eCallRecordingStarted graduated out of this list into real handlers
+    // above.
     const DIAGNOSTIC_EVENTS = [
       "eAgentOfferContactRona",
       "eAgentOfferConsult",
-      "eAgentContactWrappedUp",
       "eAgentContactAniUpdated",
-      "eCallRecordingStarted",
       "eContactOwnerChanged",
       "eAgentConsultCreated",
       "eAgentConsulting",
