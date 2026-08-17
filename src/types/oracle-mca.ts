@@ -7,11 +7,14 @@
 // inventing its own postMessage format. Confirmed against:
 //   - Oracle's official docs: https://docs.oracle.com/en/cloud/saas/fusion-service/faiec/overview-of-interaction-apis.html
 //     and https://docs.oracle.com/en/cloud/saas/fusion-service/fuief/{startcommevent,newcommevent}.html
-//   - The actual library this environment loads (window.svcMca.tlb), version
-//     path oj-mca/.../mcaInteractionV1.js
+//   - The library source itself, downloaded and read directly (not via a
+//     lossy summarizer) at oj-mca/2607.10.260931029/.../mcaInteractionV1.js.
+//     The shape below (methods under `.api`, `closeCommEvent`'s `reason`
+//     param, `onToolbarAgentCommand`'s channel args, self-initializing at
+//     script-load time) is transcribed straight from that source, not
+//     inferred.
 //
-// Fields marked UNVERIFIED below are inferred (naming convention, or not
-// shown in the specific doc pages/source reachable at review time) rather
+// Fields marked UNVERIFIED below are inferred (naming convention) rather
 // than confirmed from an official source — kept as named constants so
 // there's a single place to correct them, and every inbound command is
 // logged raw (see OracleMcaService) so a wrong guess is visible in the
@@ -95,9 +98,24 @@ export interface McaAgentCommand extends McaCommandBase {
 
 export type McaCallback<T = unknown> = (response: T) => void;
 
-/** Public API surface of window.svcMca.tlb, per the library's own source. */
+/**
+ * window.svcMca.tlb's real shape. Two things that don't match a naive
+ * read of the docs:
+ *   - `initialize()` runs automatically at script-load time (the file's
+ *     own last two lines: `var mcaTlb = new mcaToolbar(); mcaTlb.initialize();`).
+ *     Calling it again re-registers the underlying window `message` /
+ *     custom-event listeners a second time — every inbound command would
+ *     fire twice. Don't call it.
+ *   - The actual callable methods live under `.tlb.api.*`, not directly
+ *     on `.tlb`.
+ */
 export interface McaToolbarApi {
+  /** Auto-invoked by the library itself on load — do not call this again. */
   initialize(): void;
+  api: McaToolbarApiMethods;
+}
+
+export interface McaToolbarApiMethods {
   readyForOperation(readiness: boolean, callback?: McaCallback): void;
   getConfiguration(configType: string | null, callback?: McaCallback): void;
   newCommEvent(
@@ -117,11 +135,13 @@ export interface McaToolbarApi {
     callback?: McaCallback,
     channelType?: string
   ): void;
+  /** `reason` sits between `inData` and `callback` — easy to miss. */
   closeCommEvent(
     channel: string,
     appClassification: string,
     eventId: string,
     inData: Record<string, string>,
+    reason: string | null,
     callback?: McaCallback,
     channelType?: string
   ): void;
@@ -148,7 +168,15 @@ export interface McaToolbarApi {
     channelType?: string
   ): void;
   onToolbarInteractionCommand(executor: (cmd: McaInteractionCommand) => void): void;
-  onToolbarAgentCommand(executor: (cmd: McaAgentCommand) => void): void;
+  /** Unlike onToolbarInteractionCommand, this is registered per-channel. */
+  onToolbarAgentCommand(channel: string, channelType: string, executor: (cmd: McaAgentCommand) => void): void;
+  interactionControlStateChanged(
+    eventId: string,
+    actionName: string,
+    newInteractionControlStates: unknown[] | undefined,
+    timestamp: number | undefined,
+    inData: Record<string, string> | undefined
+  ): void;
 }
 
 declare global {
