@@ -7,4 +7,7 @@ export default defineConfig({
   server: {
     allowedHosts: ['ubuntu-clone.tail4794a2.ts.net'],
   },
+  preview: {
+    allowedHosts: ['ubuntu-clone.tail4794a2.ts.net'],
+  },
 })

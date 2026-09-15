@@ -56,8 +56,54 @@
     dialer: {
       startOutdial: function (data) { console.log("[MOCK] dialer.startOutdial", data); return ok(data); },
     },
+    aqm: {
+      agent: {
+        eAgentStateChangeSuccess: {
+          listen: function (cb) {
+            on("aqm.agent", "eAgentStateChangeSuccess", cb);
+            return { stopListen: function () {} };
+          },
+        },
+        eAgentStationLoginSuccess: {
+          listen: function (cb) {
+            on("aqm.agent", "eAgentStationLoginSuccess", cb);
+            return { stopListen: function () {} };
+          },
+        },
+        eAgentReloginSuccess: {
+          listen: function (cb) {
+            on("aqm.agent", "eAgentReloginSuccess", cb);
+            return { stopListen: function () {} };
+          },
+        },
+        eAgentChannelStateChanged: {
+          listen: function (cb) {
+            on("aqm.agent", "eAgentChannelStateChanged", cb);
+            return { stopListen: function () {} };
+          },
+        },
+      },
+    },
     agentStateInfo: {
-      stateChange: function (data) { console.log("[MOCK] agentStateInfo.stateChange", data); return ok(data); },
+      latestData: {
+        status: "Available",
+        subStatus: "Available",
+        agentName: "Mock Agent",
+        agentProfileID: "prof-123",
+      },
+      addEventListener: function (event, cb) { on("agentStateInfo", event, cb); },
+      stateChange: function (data) {
+        console.log("[MOCK] agentStateInfo.stateChange", data);
+        window.AGENTX_SERVICE.agentStateInfo.latestData.status = data.state;
+        window.AGENTX_SERVICE.agentStateInfo.latestData.subStatus = data.state;
+        if (window.__mockWxCC) {
+          window.__mockWxCC.fire("agentStateInfo", "updated", [
+            { name: "status", value: data.state },
+            { name: "subStatus", value: data.state },
+          ]);
+        }
+        return ok(data);
+      },
     },
   };
 

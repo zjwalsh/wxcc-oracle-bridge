@@ -13,6 +13,12 @@ import { defineConfig } from 'vite'
 // emptyOutDir is false so this doesn't wipe the other public/ assets.
 export default defineConfig({
   publicDir: false, // outDir is public/ itself — don't have Vite also copy it into itself
+  server: {
+    allowedHosts: ['ubuntu-clone.tail4794a2.ts.net'],
+  },
+  preview: {
+    allowedHosts: ['ubuntu-clone.tail4794a2.ts.net'],
+  },
   build: {
     outDir: 'public',
     emptyOutDir: false,

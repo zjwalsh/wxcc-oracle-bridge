@@ -77,6 +77,27 @@ class OracleMcaService {
     });
   }
 
+  /**
+   * Oracle's callback fires for a local/transport ack (readyForOperation,
+   * agentStateEvent) but a call whose eventId/channel/appClassification
+   * doesn't route to anything on Oracle's side can be silently dropped
+   * server-side with no callback and no error at all — logs nothing to
+   * find. This makes that failure mode visible instead of invisible.
+   */
+  private withTimeoutWarning<T>(method: string, eventId: string, callback: (res: T) => void, timeoutMs = 6000): (res: T) => void {
+    const timer = setTimeout(() => {
+      log.warn(
+        `← Oracle: no response to ${method} after ${timeoutMs}ms (eventId=${eventId}) — Oracle likely dropped this ` +
+          `server-side rather than erroring. Check MCA_APP_CLASSIFICATION ("${MCA_APP_CLASSIFICATION}") matches this ` +
+          `org's actual Fusion Service classification, and that the channel/queue config routes it.`
+      );
+    }, timeoutMs);
+    return (res: T) => {
+      clearTimeout(timer);
+      callback(res);
+    };
+  }
+
   /** Registered by WxCCService — commands Oracle sends about an active call (accept/hold/disconnect/transfer/...). */
   onInteractionCommand(handler: InteractionCommandHandler): void {
     this.interactionHandler = handler;
@@ -141,18 +162,18 @@ class OracleMcaService {
   newCommEvent(eventId: string, inData: Record<string, string>): void {
     if (!this.api) return;
     log.info("→ Oracle: newCommEvent", { eventId, inData });
+    // Matches startCommEvent's arg shape (no lookupObject) — the UI Events
+    // Framework's phoneContext.publish() path (Oracle's documented sample
+    // for this event) isn't usable here: window.CX_SVC_UI_EVENTS_FRAMEWORK
+    // is confirmed absent — this bridge runs inside WxCC Desktop's own
+    // document, not inside an Oracle-hosted page/iframe, so that global is
+    // never injected. window.svcMca.tlb.api is the only transport available.
     this.api.newCommEvent(
       MCA_CHANNEL,
       MCA_APP_CLASSIFICATION,
       eventId,
       inData,
-      null,
-      // Bumped from debug to info: this response may carry a
-      // screenPopMode field (per Oracle guidance found 2026-08-17)
-      // controlling whether Oracle treats this as an active navigation
-      // trigger vs. generic background storage — worth being sure it's
-      // visible rather than risk it being filtered at debug level.
-      (res) => log.info("newCommEvent response", res),
+      this.withTimeoutWarning("newCommEvent", eventId, (res) => log.info("newCommEvent response", res)),
       MCA_CHANNEL_TYPE
     );
   }
@@ -165,7 +186,7 @@ class OracleMcaService {
       MCA_APP_CLASSIFICATION,
       eventId,
       inData,
-      (res) => log.info("startCommEvent response", res),
+      this.withTimeoutWarning("startCommEvent", eventId, (res) => log.info("startCommEvent response", res)),
       MCA_CHANNEL_TYPE
     );
   }
@@ -179,7 +200,7 @@ class OracleMcaService {
       eventId,
       inData,
       reason,
-      (res) => log.info("closeCommEvent response", res),
+      this.withTimeoutWarning("closeCommEvent", eventId, (res) => log.info("closeCommEvent response", res)),
       MCA_CHANNEL_TYPE
     );
   }
@@ -194,6 +215,42 @@ class OracleMcaService {
       pageCode,
       pageData,
       (res) => log.info("invokeScreenPop response", res),
+      MCA_CHANNEL_TYPE
+    );
+  }
+
+  agentStateEvent(
+    eventId: string,
+    isAvailable: boolean,
+    isLoggedIn: boolean,
+    stateCd: string,
+    stateDisplayString: string,
+    reasonCd: string = "",
+    reasonDisplayString: string = "",
+    inData: Record<string, string> = {}
+  ): void {
+    if (!this.api) return;
+    log.info("→ Oracle: agentStateEvent", {
+      eventId,
+      isAvailable,
+      isLoggedIn,
+      stateCd,
+      stateDisplayString,
+      reasonCd,
+      reasonDisplayString,
+      inData,
+    });
+    this.api.agentStateEvent(
+      MCA_CHANNEL,
+      eventId,
+      isAvailable,
+      isLoggedIn,
+      stateCd,
+      stateDisplayString,
+      reasonCd,
+      reasonDisplayString,
+      inData,
+      (res) => log.info("agentStateEvent response", res),
       MCA_CHANNEL_TYPE
     );
   }

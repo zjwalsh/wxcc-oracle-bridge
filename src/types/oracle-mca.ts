@@ -17,8 +17,7 @@
 // Fields marked UNVERIFIED below are inferred (naming convention) rather
 // than confirmed from an official source — kept as named constants so
 // there's a single place to correct them, and every inbound command is
-// logged raw (see OracleMcaService) so a wrong guess is visible in the
-// exported logs instead of failing silently.
+// logged raw (see OracleMcaService) so a wrong guess is visible in the// exported logs instead of failing silently.
 
 /** This widget is voice-only. */
 export const MCA_CHANNEL = "PHONE";
@@ -128,12 +127,12 @@ export interface McaToolbarApi {
 export interface McaToolbarApiMethods {
   readyForOperation(readiness: boolean, callback?: McaCallback): void;
   getConfiguration(configType: string | null, callback?: McaCallback): void;
+  /** Matches startCommEvent's arg shape — no lookupObject param, unlike Oracle's docs example. */
   newCommEvent(
     channel: string,
     appClassification: string,
     eventId: string,
     inData: Record<string, string>,
-    lookupObject: unknown,
     callback?: McaCallback,
     channelType?: string
   ): void;

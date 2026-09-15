@@ -101,6 +101,16 @@ function extractScreenPopInfo(detail: unknown): { name: string; url: string } {
   return { name: d?.data?.screenPopName ?? "", url: d?.data?.screenPopUrl ?? "" };
 }
 
+function getAgentxService(): any {
+  if (typeof window === "undefined") return null;
+  return (
+    (window as any).AGENTX_SERVICE ??
+    (window.parent as any)?.AGENTX_SERVICE ??
+    (window.top as any)?.AGENTX_SERVICE ??
+    null
+  );
+}
+
 /** Builds the inData object sent to Oracle's newCommEvent/startCommEvent/closeCommEvent. */
 function toMcaInData(info: ContactInfo): Record<string, string> {
   const inData: Record<string, string> = {
@@ -155,6 +165,9 @@ class WxCCService {
     // load right now.
     try {
       await oracleMca.init();
+      if (Desktop.agentStateInfo?.latestData?.status) {
+        this.sendAgentState("initialState");
+      }
     } catch (err) {
       log.error("Oracle MCA failed to initialize (WxCC SDK is still up)", errInfo(err));
     }
@@ -174,20 +187,40 @@ class WxCCService {
   // ─── WxCC → Oracle ────────────────────────────────────────────────────────
 
   private registerWxCCEvents(): void {
-    Desktop.agentContact.addEventListener("eAgentOfferContact", (detail: Service.Aqm.Contact.AgentContact) => {
-      log.debug("eAgentOfferContact raw payload", detail);
+    const handleOfferContact = (source: string, detail: unknown) => {
+      log.debug(`${source} raw payload`, detail);
       const info = extractContactInfo(detail);
+      if (!info.interactionId) {
+        log.warn(`${source}: no interactionId in payload — cannot offer contact`, detail);
+        return;
+      }
       this.activeCall = {
         ...info,
         startedAt: new Date(),
         state: "incoming",
       };
-      log.info("eAgentOfferContact", info);
-      // newCommEvent is Oracle's mandatory first call for any communication.
+      log.info(source, info);
+      // newCommEvent is Oracle's mandatory first call on call start / offer.
       // eventId = WxCC interactionId, consistently, so inbound commands
       // (which echo eventId back) can be correlated to the right call.
       oracleMca.newCommEvent(info.interactionId, toMcaInData(info));
       this.notify("incoming");
+    };
+
+    Desktop.agentContact.addEventListener("eAgentOfferContact", (detail: Service.Aqm.Contact.AgentContact) => {
+      handleOfferContact("eAgentOfferContact", detail);
+    });
+
+    Desktop.agentContact.addEventListener("eAgentOfferConsult", (detail: unknown) => {
+      handleOfferContact("eAgentOfferConsult", detail);
+    });
+
+    Desktop.agentContact.addEventListener("eAgentOfferCampaignReserved", (detail: unknown) => {
+      handleOfferContact("eAgentOfferCampaignReserved", detail);
+    });
+
+    Desktop.agentContact.addEventListener("eAgentAddCampaignReserved", (detail: unknown) => {
+      handleOfferContact("eAgentAddCampaignReserved", detail);
     });
 
     // Cisco's own official headless-widget sample (WebexSamples/webex-
@@ -201,10 +234,23 @@ class WxCCService {
     // the same call.
     const connectContact = (source: string, detail: unknown) => {
       log.debug(`${source} raw payload`, detail);
-      const { interactionId: fromEvent } = extractContactInfo(detail);
+      const info = extractContactInfo(detail);
+      const fromEvent = info.interactionId;
       if (!this.activeCall) {
-        log.warn(`${source}: no active call tracked — ignoring`, { interactionId: fromEvent });
-        return;
+        let interactionId = fromEvent;
+        if (!interactionId) {
+          log.warn(`${source}: no active call tracked and no interactionId in payload — ignoring`, detail);
+          return;
+        }
+        // Call connected directly without a preceding offer event (e.g. outbound call or direct connection)
+        this.activeCall = {
+          ...info,
+          interactionId,
+          startedAt: new Date(),
+          state: "incoming",
+        };
+        log.info(`${source}: call started without preceding offer — sending newCommEvent`, this.activeCall);
+        oracleMca.newCommEvent(interactionId, toMcaInData(this.activeCall));
       }
       if (this.activeCall.state === "connected") {
         log.debug(`${source}: already connected — ignoring (likely another connect-signal event also firing for the same call)`);
@@ -216,9 +262,7 @@ class WxCCService {
         // a proxy for "connected" on WebRTC calls where the usual events
         // never fire — see below) haven't had their exact payload shape
         // confirmed. Fall back to the one call we're tracking rather than
-        // reject outright — was a silent `return` before with no logging
-        // at all, the exact kind of gap that made startCommEvent never
-        // firing invisible last time.
+        // reject outright.
         log.debug(`${source}: no interactionId in payload — falling back to tracked call`, {
           tracked: this.activeCall.interactionId,
         });
@@ -367,7 +411,6 @@ class WxCCService {
     // above.
     const DIAGNOSTIC_EVENTS = [
       "eAgentOfferContactRona",
-      "eAgentOfferConsult",
       "eAgentContactAniUpdated",
       "eContactOwnerChanged",
       "eAgentConsultCreated",
@@ -378,6 +421,177 @@ class WxCCService {
         log.info(`[diagnostic] ${eventName} fired`, detail);
       });
     });
+
+    // Listen for agent channel state changes from WxCC and notify Oracle via agentStateEvent.
+    Desktop.agentStateInfo.addEventListener("eAgentChannelStateChanged", (detail: unknown) => {
+      log.debug("eAgentChannelStateChanged raw payload", detail);
+      const d = detail as {
+        data?: {
+          agentId?: string;
+          channelType?: string;
+          state?: string;
+          lastStateChangeReason?: string;
+          auxCodeId?: string;
+          idleCode?: { id?: string; name?: string };
+        };
+        agentId?: string;
+        channelType?: string;
+        state?: string;
+        lastStateChangeReason?: string;
+        auxCodeId?: string;
+      };
+
+      const rawState = d?.data?.state ?? d?.state;
+      this.sendAgentState("eAgentChannelStateChanged", {
+        status: rawState,
+        idleCode: d?.data?.idleCode,
+        agentId: d?.data?.agentId ?? d?.agentId,
+        channelType: d?.data?.channelType ?? d?.channelType,
+      });
+    });
+
+    // In standard WxCC voice setups, agent state changes trigger eAgentStateChangeSuccess
+    // which updates latestData and emits "updated" on agentStateInfo.
+    Desktop.agentStateInfo.addEventListener("updated", (changes: unknown) => {
+      log.debug("agentStateInfo 'updated' raw payload", changes);
+      const changeList = changes as Array<{ name?: string; value?: unknown }>;
+      if (Array.isArray(changeList)) {
+        const hasStateChange = changeList.some(
+          (c) => c?.name === "status" || c?.name === "subStatus" || c?.name === "idleCode"
+        );
+        if (hasStateChange) {
+          this.sendAgentState("agentStateInfo.updated");
+        }
+      }
+    });
+
+    Desktop.agentStateInfo.addEventListener("eAgentReloginSuccess", (detail: unknown) => {
+      log.debug("eAgentReloginSuccess raw payload", detail);
+      this.sendAgentState("eAgentReloginSuccess");
+    });
+
+    Desktop.agentStateInfo.addEventListener("eAgentChannelReloginSuccess", (detail: unknown) => {
+      log.debug("eAgentChannelReloginSuccess raw payload", detail);
+      this.sendAgentState("eAgentChannelReloginSuccess");
+    });
+
+    // Directly bind to AQM agent service if present (captures eAgentStateChangeSuccess, login, and channel changes)
+    const agentx = getAgentxService();
+    if (agentx?.aqm?.agent) {
+      log.info("Attaching direct listeners to AGENTX_SERVICE.aqm.agent");
+      const agentService = agentx.aqm.agent;
+
+      if (typeof agentService.eAgentStateChangeSuccess?.listen === "function") {
+        agentService.eAgentStateChangeSuccess.listen((payload: any) => {
+          log.info("[direct AQM] eAgentStateChangeSuccess fired", payload);
+          const data = payload?.data;
+          this.sendAgentState("direct AQM eAgentStateChangeSuccess", {
+            status: data?.status,
+            subStatus: data?.subStatus,
+            idleCode: data?.auxCodeId ? { id: data.auxCodeId, name: data.subStatus || data.status } : undefined,
+            agentId: data?.agentSessionId,
+          });
+        });
+      }
+
+      if (typeof agentService.eAgentStationLoginSuccess?.listen === "function") {
+        agentService.eAgentStationLoginSuccess.listen((payload: any) => {
+          log.info("[direct AQM] eAgentStationLoginSuccess fired", payload);
+          const data = payload?.data;
+          this.sendAgentState("direct AQM eAgentStationLoginSuccess", {
+            status: data?.status,
+            subStatus: data?.subStatus,
+            idleCode: data?.auxCodeId ? { id: data.auxCodeId, name: data.subStatus || data.status } : undefined,
+            agentId: data?.agentSessionId,
+          });
+        });
+      }
+
+      if (typeof agentService.eAgentReloginSuccess?.listen === "function") {
+        agentService.eAgentReloginSuccess.listen((payload: any) => {
+          log.info("[direct AQM] eAgentReloginSuccess fired", payload);
+          const data = payload?.data;
+          this.sendAgentState("direct AQM eAgentReloginSuccess", {
+            status: data?.status,
+            subStatus: data?.subStatus,
+            idleCode: data?.auxCodeId ? { id: data.auxCodeId, name: data.subStatus || data.status } : undefined,
+            agentId: data?.agentSessionId,
+          });
+        });
+      }
+
+      if (typeof agentService.eAgentChannelStateChanged?.listen === "function") {
+        agentService.eAgentChannelStateChanged.listen((payload: any) => {
+          log.info("[direct AQM] eAgentChannelStateChanged fired", payload);
+          const data = payload?.data;
+          this.sendAgentState("direct AQM eAgentChannelStateChanged", {
+            status: data?.state ?? data?.status,
+            subStatus: data?.lastStateChangeReason,
+            idleCode: data?.auxCodeId ? { id: data.auxCodeId, name: data.lastStateChangeReason || "" } : undefined,
+            agentId: data?.agentId,
+            channelType: data?.channelType,
+          });
+        });
+      }
+    }
+  }
+
+  private sendAgentState(
+    source: string,
+    stateInfo?: {
+      status?: string;
+      subStatus?: string;
+      idleCode?: { id?: string; name?: string };
+      agentId?: string;
+      channelType?: string;
+    }
+  ): void {
+    const latest = Desktop.agentStateInfo.latestData;
+    const rawState = stateInfo?.status ?? latest?.status ?? "";
+    const rawSubStatus = stateInfo?.subStatus ?? latest?.subStatus ?? "";
+    
+    // Check both status and subStatus (e.g. status: "LoggedIn", subStatus: "Available")
+    const isAvailable =
+      rawState.toUpperCase() === "AVAILABLE" ||
+      rawSubStatus.toUpperCase() === "AVAILABLE";
+
+    const isLoggedIn =
+      rawState.toUpperCase() !== "LOGGEDOUT" &&
+      rawState.toUpperCase() !== "LOGOUT" &&
+      rawState !== "";
+
+    const stateCd = isAvailable ? "Available" : (rawState || "Idle");
+    const stateDisplayString = isAvailable ? "Available" : (rawSubStatus || rawState || "Idle");
+
+    const idleCode = stateInfo?.idleCode ?? latest?.idleCode;
+    const reasonCd = idleCode?.id ?? "";
+    const reasonDisplayString = idleCode?.name ?? rawSubStatus ?? "";
+
+    const eventId = stateInfo?.agentId ?? latest?.agentProfileID ?? `agent-state-${Date.now()}`;
+
+    log.info(`→ Oracle: agentStateEvent (${source})`, {
+      rawState,
+      rawSubStatus,
+      isAvailable,
+      isLoggedIn,
+      stateCd,
+      reasonCd,
+      reasonDisplayString,
+    });
+
+    oracleMca.agentStateEvent(
+      eventId,
+      isAvailable,
+      isLoggedIn,
+      stateCd,
+      stateDisplayString,
+      reasonCd,
+      reasonDisplayString,
+      {
+        channel: MCA_CHANNEL,
+        channelType: stateInfo?.channelType ?? "ORA_SVC_PHONE",
+      }
+    );
   }
 
   // ─── Oracle → WxCC ────────────────────────────────────────────────────────
@@ -442,7 +656,21 @@ class WxCCService {
             supportedFeatures: [],
           };
           return;
-        case "getCurrentAgentState":
+        case "getCurrentAgentState": {
+          const latest = Desktop.agentStateInfo.latestData;
+          const rawState = latest?.status ?? "";
+          const isAvailable = rawState.toUpperCase() === "AVAILABLE";
+          const isLoggedIn = rawState.toUpperCase() !== "LOGGEDOUT" && rawState.toUpperCase() !== "LOGOUT" && rawState !== "";
+          cmd.outData = {
+            isAvailable,
+            isLoggedIn,
+            stateCd: rawState || (isAvailable ? "Available" : "Idle"),
+            stateDisplayString: rawState || (isAvailable ? "Available" : "Idle"),
+            reasonCd: latest?.idleCode?.id ?? "",
+            reasonDisplayString: latest?.idleCode?.name ?? latest?.subStatus ?? "",
+          };
+          return;
+        }
         case "getActiveEngagements":
         case "custom":
           throw new Error(`${cmd.command}: not implemented yet`);
