@@ -1,7 +1,7 @@
 import { Desktop, type Service } from "@wxcc-desktop/sdk";
 import { oracleMca } from "./OracleMcaService";
 import { log, errInfo } from "./logger";
-import { MCA_ATTR, MCA_CHANNEL } from "../types/oracle-mca";
+import { MCA_ATTR, MCA_CHANNEL, MCA_DIRECTION_INBOUND } from "../types/oracle-mca";
 import type { McaAgentCommand, McaInteractionCommand, McaInteractionCommandName } from "../types/oracle-mca";
 
 /** Interaction commands actually wired to a WxCC action below — also reported to Oracle via getActiveInteractionCommands. */
@@ -95,6 +95,11 @@ function extractContactInfo(detail: unknown): ContactInfo {
   };
 }
 
+/** Oracle expects the ANI without the leading "+"; WxCC sends E.164 (+1XXXXXXXXXX). */
+function stripLeadingPlus(ani: string): string {
+  return ani.replace(/^\+/, "");
+}
+
 /** Best-effort — see the NOTE at the eScreenPop listener for confidence level. */
 function extractScreenPopInfo(detail: unknown): { name: string; url: string } {
   const d = detail as { data?: { screenPopName?: string; screenPopUrl?: string } };
@@ -111,22 +116,45 @@ function getAgentxService(): any {
   );
 }
 
-/** Builds the inData object sent to Oracle's newCommEvent/startCommEvent/closeCommEvent. */
-function toMcaInData(info: ContactInfo): Record<string, string> {
+/**
+ * Builds the inData object sent to Oracle's newCommEvent/startCommEvent/closeCommEvent.
+ *
+ * `forNewCommEvent` marks the newCommEvent-specific differences:
+ * - SVCMCA_INTERACTION_ID is omitted: Oracle's own response to that call
+ *   comes back with an interaction id in its outData, which
+ *   OracleMcaService merges into the following startCommEvent/closeCommEvent
+ *   (see pendingOutData) — sending our own value up front would just be a
+ *   guess ahead of the one Oracle hands back.
+ * - SVCMCA_COMMUNICATION_DIRECTION is set: this widget only ever offers
+ *   inbound calls to newCommEvent.
+ */
+function toMcaInData(info: ContactInfo, forNewCommEvent = false): Record<string, string> {
   const inData: Record<string, string> = {
-    [MCA_ATTR.ANI]: info.ani,
+    [MCA_ATTR.ANI]: stripLeadingPlus(info.ani),
     [MCA_ATTR.DNIS]: info.dnis,
     [MCA_ATTR.QUEUE]: info.queueName,
+    channel: MCA_CHANNEL,
+  };
+  if (forNewCommEvent) {
+    inData[MCA_ATTR.COMMUNICATION_DIRECTION] = MCA_DIRECTION_INBOUND;
+  } else {
     // Per Oracle guidance: IMcaStartCommInData's "standard parameters"
     // (interactionId, channel) should be explicit inData keys, not just
     // the positional eventId/channel args the API call already takes —
     // possibly related to the MSI screen-pop focus failure.
-    [MCA_ATTR.INTERACTION_ID]: info.interactionId,
-    channel: MCA_CHANNEL,
-  };
+    inData[MCA_ATTR.INTERACTION_ID] = info.interactionId;
+  }
   // Pass CAD variables through as-is too — harmless if Oracle doesn't
   // recognize a given key, useful if it happens to match a configured token.
-  return { ...info.callData, ...inData };
+  // A CAD variable literally named "ani" (case-insensitive) is Oracle's own
+  // FC-DESKTOP-VIEW pop-over token, carrying the same E.164 value — strip
+  // it the same way as SVCMCA_ANI above.
+  const callData = Object.fromEntries(
+    Object.entries(info.callData).map(([key, value]) =>
+      key.toLowerCase() === "ani" ? [key, stripLeadingPlus(value)] : [key, value]
+    )
+  );
+  return { ...callData, ...inData };
 }
 
 /**
@@ -194,6 +222,18 @@ class WxCCService {
         log.warn(`${source}: no interactionId in payload — cannot offer contact`, detail);
         return;
       }
+      // Multiple offer-shaped events (eAgentOfferContact, eAgentOfferConsult,
+      // eAgentOfferCampaignReserved, eAgentAddCampaignReserved) can all fire
+      // for the same interaction. Sending newCommEvent twice for the same
+      // eventId is the likely cause of Oracle's toolbar library silently
+      // dropping one of the two responses (it correlates its pending
+      // callback by eventId, so the second call's registration clobbers the
+      // first's) — visible as "no response to newCommEvent" even though
+      // Oracle did receive it. Only send it once per interactionId.
+      if (this.activeCall?.interactionId === info.interactionId) {
+        log.debug(`${source}: already offered this interactionId — skipping duplicate newCommEvent`, info);
+        return;
+      }
       this.activeCall = {
         ...info,
         startedAt: new Date(),
@@ -203,7 +243,7 @@ class WxCCService {
       // newCommEvent is Oracle's mandatory first call on call start / offer.
       // eventId = WxCC interactionId, consistently, so inbound commands
       // (which echo eventId back) can be correlated to the right call.
-      oracleMca.newCommEvent(info.interactionId, toMcaInData(info));
+      oracleMca.newCommEvent(info.interactionId, toMcaInData(info, true));
       this.notify("incoming");
     };
 
@@ -250,7 +290,7 @@ class WxCCService {
           state: "incoming",
         };
         log.info(`${source}: call started without preceding offer — sending newCommEvent`, this.activeCall);
-        oracleMca.newCommEvent(interactionId, toMcaInData(this.activeCall));
+        oracleMca.newCommEvent(interactionId, toMcaInData(this.activeCall, true));
       }
       if (this.activeCall.state === "connected") {
         log.debug(`${source}: already connected — ignoring (likely another connect-signal event also firing for the same call)`);
@@ -280,23 +320,16 @@ class WxCCService {
       this.notify("connected");
     };
 
-    Desktop.agentContact.addEventListener("eAgentContact", (detail: Service.Aqm.Contact.AgentContact) => {
-      connectContact("eAgentContact", detail);
-    });
-
-    Desktop.agentContact.addEventListener("eAgentContactAssigned", (detail: Service.Aqm.Contact.AgentContact) => {
-      connectContact("eAgentContactAssigned", detail);
-    });
-
-    // Confirmed by testing: for WebRTC calls in this environment, neither
-    // eAgentContact nor eAgentContactAssigned fires at all (verified via a
-    // wide diagnostic sniffer across every other plausible contact-
-    // lifecycle event) — eCallRecordingStarted was the only one that did.
-    // Using it as the de facto "connected" signal since recording
-    // typically starts right when a call connects. Caveat: if recording
-    // is ever disabled for some call/queue in this org, that call would
-    // never trigger startCommEvent — worth revisiting if that turns out
-    // to matter.
+    // eAgentContactAssigned does fire in this environment (despite an
+    // earlier assumption otherwise) — but firing startCommEvent from it
+    // races ahead of newCommEvent's own ack when the agent answers fast
+    // (~1-2s), since Oracle's toolbar backend apparently won't ack
+    // newCommEvent once startCommEvent for the same interaction has
+    // already landed. eCallRecordingStarted fires a beat later and gives
+    // newCommEvent's ack time to arrive first, so it's used as the sole
+    // connect signal instead. Caveat: if recording is ever disabled for
+    // some call/queue in this org, that call would never trigger
+    // startCommEvent — worth revisiting if that turns out to matter.
     Desktop.agentContact.addEventListener("eCallRecordingStarted", (detail: unknown) => {
       connectContact("eCallRecordingStarted", detail);
     });
@@ -371,23 +404,16 @@ class WxCCService {
     Desktop.agentContact.addEventListener("eAgentContactEnded", (detail: Service.Aqm.Contact.AgentContact) => {
       log.debug("eAgentContactEnded raw payload", detail);
       const { interactionId } = extractContactInfo(detail);
-      if (!this.activeCall) {
-        // Expected in this org — closeCommEvent already went out from
-        // eAgentContactWrappedUp above. Guarded so this can't double-fire
-        // closeCommEvent for the same eventId if this event ever does end
-        // up firing in some other scenario (e.g. a declined/never-
-        // connected call, which wouldn't go through wrap-up at all).
-        log.info("eAgentContactEnded: no active call — already handled (e.g. via wrap-up)", { interactionId });
-        this.notify("idle");
-        return;
-      }
-      const duration = Math.round((Date.now() - this.activeCall.startedAt.getTime()) / 1000);
-      log.info("eAgentContactEnded", { interactionId, duration });
-      // closeCommEvent is Oracle's other mandatory call — disconnects the
-      // engagement on Oracle's side.
-      oracleMca.closeCommEvent(interactionId, { duration: String(duration) });
-      this.activeCall = null;
-      this.notify("idle");
+      // Confirmed by testing: in this org, eAgentContactEnded fires the
+      // moment the call itself disconnects — BEFORE wrap-up starts, not
+      // after. It carries no ANI/DNIS/queue/CAD data, only enough to
+      // compute duration. Previously this sent closeCommEvent here (with
+      // just {duration}) and nulled activeCall, which pre-empted
+      // eAgentContactWrappedUp's later, data-rich closeCommEvent — that
+      // handler would then see activeCall already null and skip sending
+      // entirely. closeCommEvent now only ever comes from
+      // eAgentContactWrappedUp; this event is logged for visibility only.
+      log.info("eAgentContactEnded — closeCommEvent deferred to eAgentContactWrappedUp", { interactionId });
     });
 
     Desktop.screenpop.addEventListener("eScreenPop", (detail: unknown) => {

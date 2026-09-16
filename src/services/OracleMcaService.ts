@@ -22,6 +22,16 @@ class OracleMcaService {
   private api: McaToolbarApiMethods | null = null;
   private interactionHandler: InteractionCommandHandler | null = null;
   private agentHandler: AgentCommandHandler | null = null;
+  // Oracle's own newCommEvent doc (fuief/newcommevent.html) says the
+  // response's outData "must be passed as inData to startCommEvent or
+  // closeCommEvent", and startCommEvent's doc is explicit that its inData
+  // "should be matching with the outData response we get in the
+  // newCommEvent operation response" — without this, Oracle can't
+  // correlate the accept/decline step back to the original ring
+  // notification, which fits the "sends but doesn't trigger the correct
+  // steps" symptom. Keyed by eventId (== WxCC interactionId, per how
+  // WxCCService calls all three).
+  private pendingOutData = new Map<string, Record<string, string>>();
 
   async init(): Promise<void> {
     log.info("Oracle MCA: window.location", window.location.href);
@@ -161,7 +171,14 @@ class OracleMcaService {
 
   newCommEvent(eventId: string, inData: Record<string, string>): void {
     if (!this.api) return;
-    log.info("→ Oracle: newCommEvent", { eventId, inData });
+    // callStatus is confirmed from Oracle's own newCommEvent doc example
+    // (request.getInData().setCallStatus('INCOMING')) — a top-level
+    // inData field, distinct from the SVCMCA_*-attribute keys set via
+    // setInDataValueByAttribute. Not previously sent; "optional" per the
+    // doc, but cheap to include and plausibly relevant to the toolbar not
+    // rendering the expected accept/decline step.
+    const fullInData = { callStatus: "INCOMING", ...inData };
+    log.info("→ Oracle: newCommEvent", { eventId, inData: fullInData });
     // Matches startCommEvent's arg shape (no lookupObject) — the UI Events
     // Framework's phoneContext.publish() path (Oracle's documented sample
     // for this event) isn't usable here: window.CX_SVC_UI_EVENTS_FRAMEWORK
@@ -172,20 +189,50 @@ class OracleMcaService {
       MCA_CHANNEL,
       MCA_APP_CLASSIFICATION,
       eventId,
-      inData,
-      this.withTimeoutWarning("newCommEvent", eventId, (res) => log.info("newCommEvent response", res)),
+      fullInData,
+      this.withTimeoutWarning("newCommEvent", eventId, (res) => {
+        log.info("newCommEvent response", res);
+        // UNVERIFIED field name on the legacy library's response (its
+        // shape isn't documented — only the UI Events Framework's
+        // response.getResponseData().getOutData() is). Logged raw above
+        // specifically so a wrong guess here is visible in the exported
+        // logs rather than a silent failure, per this file's existing
+        // pattern.
+        const outData = (res as { outData?: Record<string, string> } | undefined)?.outData;
+        if (outData) {
+          log.info("newCommEvent: storing outData to forward into startCommEvent/closeCommEvent", {
+            eventId,
+            outData,
+          });
+          this.pendingOutData.set(eventId, outData);
+        } else {
+          log.warn(
+            "newCommEvent: response has no outData — startCommEvent/closeCommEvent will go out without it, " +
+              "which Oracle's docs say they need to correlate back to this ring notification",
+            { eventId, res }
+          );
+        }
+      }),
       MCA_CHANNEL_TYPE
     );
   }
 
+  /** Merges in outData captured from newCommEvent's response, per Oracle's documented contract (see pendingOutData). */
+  private withPendingOutData(eventId: string, inData: Record<string, string>): Record<string, string> {
+    const outData = this.pendingOutData.get(eventId);
+    this.pendingOutData.delete(eventId);
+    return outData ? { ...inData, ...outData } : inData;
+  }
+
   startCommEvent(eventId: string, inData: Record<string, string>): void {
     if (!this.api) return;
-    log.info("→ Oracle: startCommEvent", { eventId, inData });
+    const fullInData = this.withPendingOutData(eventId, inData);
+    log.info("→ Oracle: startCommEvent", { eventId, inData: fullInData });
     this.api.startCommEvent(
       MCA_CHANNEL,
       MCA_APP_CLASSIFICATION,
       eventId,
-      inData,
+      fullInData,
       this.withTimeoutWarning("startCommEvent", eventId, (res) => log.info("startCommEvent response", res)),
       MCA_CHANNEL_TYPE
     );
@@ -193,12 +240,13 @@ class OracleMcaService {
 
   closeCommEvent(eventId: string, inData: Record<string, string>, reason: string | null = null): void {
     if (!this.api) return;
-    log.info("→ Oracle: closeCommEvent", { eventId, inData, reason });
+    const fullInData = this.withPendingOutData(eventId, inData);
+    log.info("→ Oracle: closeCommEvent", { eventId, inData: fullInData, reason });
     this.api.closeCommEvent(
       MCA_CHANNEL,
       MCA_APP_CLASSIFICATION,
       eventId,
-      inData,
+      fullInData,
       reason,
       this.withTimeoutWarning("closeCommEvent", eventId, (res) => log.info("closeCommEvent response", res)),
       MCA_CHANNEL_TYPE

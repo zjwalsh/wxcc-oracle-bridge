@@ -43,7 +43,11 @@ export const MCA_ATTR = {
   SR_NUM: "SVCMCA_SR_NUM", // confirmed: docs' startCommEvent example
   CONTACT_NUMBER: "SVCMCA_CONTACT_NUMBER", // confirmed: docs' response example
   PARENT_INTERACTION_ID: "SVCMCA_PARENT_INTERACTION_ID", // confirmed: docs, transfer scenarios
+  COMMUNICATION_DIRECTION: "SVCMCA_COMMUNICATION_DIRECTION", // UNVERIFIED
 } as const;
+
+/** This widget only ever offers inbound calls to newCommEvent. */
+export const MCA_DIRECTION_INBOUND = "ORA_SVC_INBOUND";
 
 /**
  * Confirmed literal values of `command` on the object passed to an

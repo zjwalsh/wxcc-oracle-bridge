@@ -84,6 +84,16 @@ in the exported logs, not a silent failure):
   `onOutgoingEvent` for this, but it isn't wired up yet.
 - `eScreenPop`'s real field names (`screenPopName`/`screenPopUrl`, from a
   Cisco sample, not a confirmed live payload).
+- `newCommEvent`'s `callStatus` inData field and the outData-forwarding
+  contract (its response must be threaded into the following
+  `startCommEvent`/`closeCommEvent` call — confirmed on Oracle's docs for
+  the promise-based UI Events Framework API, `fuief/newcommevent.html` and
+  `fuief/startcommevent.html`, but not documented anywhere for the legacy
+  `window.svcMca.tlb.api` this bridge actually uses). `OracleMcaService`
+  now does this forwarding, but the response field name it reads
+  (`res.outData`) is a guess based on the codebase's `outData` naming
+  convention elsewhere, not a confirmed field on the legacy library's
+  callback — logged raw either way so a wrong guess is visible.
 
 ## Development
 
