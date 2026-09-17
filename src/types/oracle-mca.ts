@@ -48,6 +48,8 @@ export const MCA_ATTR = {
 
 /** This widget only ever offers inbound calls to newCommEvent. */
 export const MCA_DIRECTION_INBOUND = "ORA_SVC_INBOUND";
+/** Confirmed literal from Oracle's onOutgoingEvent doc (facti/outbound-calls.html). */
+export const MCA_DIRECTION_OUTBOUND = "ORA_SVC_OUTBOUND";
 
 /**
  * Confirmed literal values of `command` on the object passed to an
@@ -183,6 +185,27 @@ export interface McaToolbarApiMethods {
   onToolbarInteractionCommand(executor: (cmd: McaInteractionCommand) => void): void;
   /** Unlike onToolbarInteractionCommand, this is registered per-channel. */
   onToolbarAgentCommand(channel: string, channelType: string, executor: (cmd: McaAgentCommand) => void): void;
+  /**
+   * Registered per-channel (confirmed from the library source: the callback
+   * is keyed by `"onOutgoingEvent" + channel` in its internal registry, same
+   * pattern as onToolbarAgentCommand). Fires when the agent initiates an
+   * outbound call from Oracle's own UI (e.g. clicking a phone number).
+   * UNVERIFIED: the shape of the object the executor receives — the library
+   * forwards the raw inbound postMessage payload as-is here (unlike
+   * onToolbarInteractionCommand/onToolbarAgentCommand, which wrap it in a
+   * typed command object with sendResponse) — so field names/nesting are
+   * only confirmed by logging one real firing.
+   */
+  onOutgoingEvent(channel: string, appClassification: string, executor: (payload: unknown) => void, channelType?: string): void;
+  /** Reports an outbound call placement failure back to Oracle. UNVERIFIED beyond the parameter list read from the library source. */
+  outboundCommError(
+    channel: string,
+    commUuid: string,
+    errorCode: string,
+    errorMsg: string,
+    callback?: McaCallback,
+    channelType?: string
+  ): void;
   interactionControlStateChanged(
     eventId: string,
     actionName: string,

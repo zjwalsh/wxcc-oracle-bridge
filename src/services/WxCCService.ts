@@ -1,11 +1,14 @@
 import { Desktop, type Service } from "@wxcc-desktop/sdk";
 import { oracleMca } from "./OracleMcaService";
 import { log, errInfo } from "./logger";
-import { MCA_ATTR, MCA_CHANNEL, MCA_DIRECTION_INBOUND } from "../types/oracle-mca";
+import { MCA_ATTR, MCA_CHANNEL, MCA_DIRECTION_INBOUND, MCA_DIRECTION_OUTBOUND } from "../types/oracle-mca";
 import type { McaAgentCommand, McaInteractionCommand, McaInteractionCommandName } from "../types/oracle-mca";
 
 /** Interaction commands actually wired to a WxCC action below — also reported to Oracle via getActiveInteractionCommands. */
 const SUPPORTED_INTERACTION_COMMANDS: McaInteractionCommandName[] = ["accept", "reject", "disconnect", "hold", "unhold"];
+
+/** WxCC Admin > Outdial > Entry Points — the entry point this org uses for agent-initiated outbound calls placed via Oracle. */
+const OUTDIAL_ENTRY_POINT_ID = "f5306fed-687e-45ed-9a86-a59289b28f50";
 
 export type CallState =
   | "idle"
@@ -17,6 +20,18 @@ export type CallState =
 
 export interface ActiveCall {
   interactionId: string;
+  /**
+   * The id used when talking to Oracle (newCommEvent/startCommEvent/
+   * closeCommEvent's eventId, and SVCMCA_INTERACTION_ID). Equal to
+   * interactionId for inbound calls (known up front, from the WxCC event
+   * that started the call). For an outbound call placed via Oracle's
+   * onOutgoingEvent, this is Oracle's own call id instead — WxCC's real
+   * interactionId isn't known until startOutdial resolves, but Oracle
+   * already needs to be told about the call before that (see
+   * registerOutboundCallHandler) and expects the same id back on every
+   * subsequent call, per its onOutgoingEvent doc sample.
+   */
+  oracleEventId: string;
   ani: string;
   dnis: string;
   queueName: string;
@@ -100,6 +115,43 @@ function stripLeadingPlus(ani: string): string {
   return ani.replace(/^\+/, "");
 }
 
+/**
+ * Pulls call id/ANI/display name out of onOutgoingEvent's raw payload.
+ * SVCMCA_ANI/SVCMCA_DISPLAY_NAME/SVCMCA_CALL_ID are confirmed field names,
+ * but only from Oracle's UI Events Framework doc (facti/outbound-calls.html)
+ * — this widget's legacy-library transport forwards the raw postMessage
+ * payload as-is (see onOutgoingEvent's doc comment in oracle-mca.ts), so
+ * where those fields actually live in it isn't confirmed. Checks the
+ * plausible nesting spots and logs the raw payload above so a wrong guess
+ * here is visible rather than silently dropping every outbound call.
+ */
+function extractOutboundCallInfo(payload: unknown): { callId: string; ani: string; displayName: string } {
+  const p = payload as Record<string, unknown> | null | undefined;
+  const candidates: Array<Record<string, unknown> | undefined> = [
+    p ?? undefined,
+    p?.data as Record<string, unknown> | undefined,
+    p?.inData as Record<string, unknown> | undefined,
+    (p?.data as Record<string, unknown> | undefined)?.inData as Record<string, unknown> | undefined,
+    p?.outData as Record<string, unknown> | undefined,
+    (p?.data as Record<string, unknown> | undefined)?.outData as Record<string, unknown> | undefined,
+  ];
+  const pick = (keys: string[]): string => {
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      for (const key of keys) {
+        const value = candidate[key];
+        if (typeof value === "string" && value) return value;
+      }
+    }
+    return "";
+  };
+  return {
+    callId: pick(["SVCMCA_CALL_ID", "callId", "eventId"]),
+    ani: pick(["SVCMCA_ANI", "ani"]),
+    displayName: pick(["SVCMCA_DISPLAY_NAME", "displayName"]),
+  };
+}
+
 /** Best-effort — see the NOTE at the eScreenPop listener for confidence level. */
 function extractScreenPopInfo(detail: unknown): { name: string; url: string } {
   const d = detail as { data?: { screenPopName?: string; screenPopUrl?: string } };
@@ -180,6 +232,7 @@ class WxCCService {
 
       this.registerWxCCEvents();
       this.registerOracleCommands();
+      this.registerOutboundCallHandler();
       log.info("WxCC Desktop SDK initialized — agent connected to widget");
     } catch (err) {
       log.error("WxCC Desktop SDK failed to initialize", errInfo(err));
@@ -236,6 +289,7 @@ class WxCCService {
       }
       this.activeCall = {
         ...info,
+        oracleEventId: info.interactionId,
         startedAt: new Date(),
         state: "incoming",
       };
@@ -282,10 +336,15 @@ class WxCCService {
           log.warn(`${source}: no active call tracked and no interactionId in payload — ignoring`, detail);
           return;
         }
-        // Call connected directly without a preceding offer event (e.g. outbound call or direct connection)
+        // Call connected directly without a preceding offer event (e.g. a
+        // WxCC-side outbound call not placed through Oracle, or a direct
+        // connection). Not to be confused with Oracle-initiated outbound
+        // (registerOutboundCallHandler below) — that path pre-populates
+        // this.activeCall itself, so this branch is skipped for it.
         this.activeCall = {
           ...info,
           interactionId,
+          oracleEventId: interactionId,
           startedAt: new Date(),
           state: "incoming",
         };
@@ -316,7 +375,7 @@ class WxCCService {
       }
       this.activeCall = { ...this.activeCall, state: "connected" };
       log.info(source, { interactionId });
-      oracleMca.startCommEvent(interactionId, toMcaInData(this.activeCall));
+      oracleMca.startCommEvent(this.activeCall.oracleEventId, toMcaInData(this.activeCall));
       this.notify("connected");
     };
 
@@ -396,7 +455,7 @@ class WxCCService {
       const interactionId = info.interactionId || this.activeCall.interactionId;
       const duration = Math.round((Date.now() - this.activeCall.startedAt.getTime()) / 1000);
       log.info("eAgentContactWrappedUp", { interactionId, duration });
-      oracleMca.closeCommEvent(interactionId, { ...toMcaInData(this.activeCall), duration: String(duration) });
+      oracleMca.closeCommEvent(this.activeCall.oracleEventId, { ...toMcaInData(this.activeCall), duration: String(duration) });
       this.activeCall = null;
       this.notify("idle");
     });
@@ -424,7 +483,7 @@ class WxCCService {
       // payload — check the raw log above if screen pops don't land.
       const { name, url } = extractScreenPopInfo(detail);
       log.info("eScreenPop", { interactionId: this.activeCall.interactionId, name, url });
-      oracleMca.invokeScreenPop(this.activeCall.interactionId, name, { url });
+      oracleMca.invokeScreenPop(this.activeCall.oracleEventId, name, { url });
     });
 
     // Diagnostic-only sniffer, kept for whatever comes up next
@@ -624,7 +683,15 @@ class WxCCService {
 
   private registerOracleCommands(): void {
     oracleMca.onInteractionCommand(async (cmd: McaInteractionCommand) => {
-      const interactionId = cmd.eventId ?? this.activeCall?.interactionId;
+      // Oracle echoes back whatever id we gave it (oracleEventId) — for an
+      // outbound call placed via onOutgoingEvent, that's Oracle's own call
+      // id, not WxCC's real interactionId, so translate back before calling
+      // into the WxCC SDK. Equivalent to using cmd.eventId as-is for inbound
+      // calls, where oracleEventId === interactionId already.
+      const interactionId =
+        this.activeCall && cmd.eventId === this.activeCall.oracleEventId
+          ? this.activeCall.interactionId
+          : cmd.eventId ?? this.activeCall?.interactionId;
       if (!interactionId) {
         throw new Error(`${cmd.command}: no interactionId (missing eventId and no active call)`);
       }
@@ -702,6 +769,86 @@ class WxCCService {
           throw new Error(`${cmd.command}: not implemented yet`);
         default:
           throw new Error(`Unrecognized agent command: ${cmd.command}`);
+      }
+    });
+  }
+
+  /**
+   * Handles Oracle-initiated outbound calls (agent clicks a phone number in
+   * Fusion, per facti/outbound-calls.html's onOutgoingEvent). Acknowledges
+   * to Oracle immediately (its doc sample does this before the call is even
+   * placed), then places the call via WxCC's own outdial API. The resulting
+   * call's lifecycle (connect/hold/wrap-up/close) is driven by the same
+   * eAgentContact* listeners registerWxCCEvents already wires for inbound
+   * calls — this only handles getting the call started and correlated back
+   * to Oracle's own call id (see ActiveCall.oracleEventId).
+   */
+  private registerOutboundCallHandler(): void {
+    oracleMca.onOutgoingCall(async (payload) => {
+      const { callId, ani, displayName } = extractOutboundCallInfo(payload);
+      if (!callId || !ani) {
+        log.warn("onOutgoingEvent: missing call id or ANI in payload — cannot place outbound call", payload);
+        return;
+      }
+      if (this.activeCall) {
+        log.warn("onOutgoingEvent: already have an active call — ignoring outbound request", {
+          callId,
+          tracked: this.activeCall.interactionId,
+        });
+        return;
+      }
+
+      // interactionId is a placeholder (Oracle's own call id) until
+      // startOutdial resolves with WxCC's real one below — Oracle needs its
+      // ack before the call can even be placed, so there's no WxCC id yet.
+      this.activeCall = {
+        interactionId: callId,
+        oracleEventId: callId,
+        ani,
+        dnis: "",
+        queueName: "",
+        callData: {},
+        startedAt: new Date(),
+        state: "incoming",
+      };
+      log.info("onOutgoingEvent: acknowledging outbound call to Oracle", { callId, ani, displayName });
+      oracleMca.newCommEvent(callId, {
+        [MCA_ATTR.ANI]: stripLeadingPlus(ani),
+        [MCA_ATTR.COMMUNICATION_DIRECTION]: MCA_DIRECTION_OUTBOUND,
+        channel: MCA_CHANNEL,
+      });
+
+      try {
+        const contact = await Desktop.dialer.startOutdial({
+          data: {
+            entryPointId: OUTDIAL_ENTRY_POINT_ID,
+            destination: stripLeadingPlus(ani),
+            direction: "OUTBOUND",
+            attributes: {},
+            mediaType: "telephony",
+            outboundType: "OUTDIAL",
+          },
+        });
+        // Still the call we started (not superseded/cleared by a race) —
+        // only then is it safe to fill in the real interactionId.
+        if (this.activeCall?.oracleEventId !== callId) return;
+        const resolvedId = contact ? extractContactInfo(contact).interactionId : "";
+        if (resolvedId) {
+          this.activeCall = { ...this.activeCall, interactionId: resolvedId };
+          log.info("onOutgoingEvent: outdial placed", { callId, interactionId: resolvedId });
+        } else {
+          log.warn(
+            "onOutgoingEvent: startOutdial resolved without a usable interactionId — relying on the connect-signal handler's fallback-to-tracked-call matching",
+            { callId, contact }
+          );
+        }
+      } catch (err) {
+        log.error("onOutgoingEvent: startOutdial failed", errInfo(err));
+        if (this.activeCall?.oracleEventId === callId) {
+          oracleMca.outboundCommError(callId, errInfo(err).message);
+          this.activeCall = null;
+          this.notify("error");
+        }
       }
     });
   }

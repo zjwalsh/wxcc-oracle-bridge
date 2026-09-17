@@ -9,6 +9,8 @@ import { log, errInfo } from "./logger";
 
 type InteractionCommandHandler = (cmd: McaInteractionCommand) => void | Promise<void>;
 type AgentCommandHandler = (cmd: McaAgentCommand) => void | Promise<void>;
+/** Raw, unwrapped payload — see onOutgoingEvent's doc comment in oracle-mca.ts for why this isn't a typed command object. */
+type OutgoingCallHandler = (payload: unknown) => void | Promise<void>;
 
 /**
  * Wraps Oracle Fusion's real Media Toolbar ("MCA") client library instead
@@ -22,6 +24,7 @@ class OracleMcaService {
   private api: McaToolbarApiMethods | null = null;
   private interactionHandler: InteractionCommandHandler | null = null;
   private agentHandler: AgentCommandHandler | null = null;
+  private outgoingCallHandler: OutgoingCallHandler | null = null;
   // Oracle's own newCommEvent doc (fuief/newcommevent.html) says the
   // response's outData "must be passed as inData to startCommEvent or
   // closeCommEvent", and startCommEvent's doc is explicit that its inData
@@ -118,6 +121,11 @@ class OracleMcaService {
     this.agentHandler = handler;
   }
 
+  /** Registered by WxCCService — fires when the agent initiates an outbound call from Oracle's own UI. */
+  onOutgoingCall(handler: OutgoingCallHandler): void {
+    this.outgoingCallHandler = handler;
+  }
+
   private registerCommandHandlers(): void {
     if (!this.api) return;
 
@@ -154,6 +162,24 @@ class OracleMcaService {
         this.respond(cmd, "failure", errInfo(err).message);
       }
     });
+
+    // Registered per-channel, same as onToolbarAgentCommand — voice-only,
+    // so this only ever fires for PHONE. Unlike the two handlers above,
+    // there's no sendResponse/result contract here (see onOutgoingEvent's
+    // doc comment) — WxCCService acknowledges via newCommEvent/
+    // outboundCommError itself instead of this method responding.
+    this.api.onOutgoingEvent(MCA_CHANNEL, MCA_APP_CLASSIFICATION, async (payload) => {
+      log.info("← Oracle onOutgoingEvent (outbound call request)", payload);
+      if (!this.outgoingCallHandler) {
+        log.warn("← Oracle onOutgoingEvent has no registered handler — outbound call request dropped");
+        return;
+      }
+      try {
+        await this.outgoingCallHandler(payload);
+      } catch (err) {
+        log.error("Oracle onOutgoingEvent handler failed", errInfo(err));
+      }
+    }, MCA_CHANNEL_TYPE);
   }
 
   private respond(cmd: McaInteractionCommand | McaAgentCommand, result: McaResult, detail?: string): void {
@@ -249,6 +275,20 @@ class OracleMcaService {
       fullInData,
       reason,
       this.withTimeoutWarning("closeCommEvent", eventId, (res) => log.info("closeCommEvent response", res)),
+      MCA_CHANNEL_TYPE
+    );
+  }
+
+  /** Reports that placing an agent-initiated outbound call (from onOutgoingEvent) failed. */
+  outboundCommError(commUuid: string, errorMsg: string, errorCode: string = "OUTDIAL_FAILED"): void {
+    if (!this.api) return;
+    log.info("→ Oracle: outboundCommError", { commUuid, errorCode, errorMsg });
+    this.api.outboundCommError(
+      MCA_CHANNEL,
+      commUuid,
+      errorCode,
+      errorMsg,
+      (res) => log.info("outboundCommError response", res),
       MCA_CHANNEL_TYPE
     );
   }
