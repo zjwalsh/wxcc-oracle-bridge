@@ -195,22 +195,24 @@ class OracleMcaService {
 
   // ─── WxCC → Oracle ────────────────────────────────────────────────────────
 
+  /**
+   * Passthrough log for every raw Webex/WxCC event, regardless of whether
+   * it results in an actual Oracle API call. Without this, only events that
+   * happen to trigger newCommEvent/startCommEvent/closeCommEvent/etc. show
+   * up on the Oracle side of the log — anything else (wrapup, hold/unhold,
+   * diagnostic-only events) is only visible in WxCCService's own logging,
+   * making it look like Oracle never received it at all.
+   */
+  logWebexEvent(eventName: string, detail: unknown): void {
+    log.info(`← Webex: ${eventName}`, detail);
+  }
+
   newCommEvent(eventId: string, inData: Record<string, string>): void {
     if (!this.api) return;
-    // callStatus is confirmed from Oracle's own newCommEvent doc example
-    // (request.getInData().setCallStatus('INCOMING')) — a top-level
-    // inData field, distinct from the SVCMCA_*-attribute keys set via
-    // setInDataValueByAttribute. Not previously sent; "optional" per the
-    // doc, but cheap to include and plausibly relevant to the toolbar not
-    // rendering the expected accept/decline step.
+
     const fullInData = { callStatus: "INCOMING", ...inData };
     log.info("→ Oracle: newCommEvent", { eventId, inData: fullInData });
-    // Matches startCommEvent's arg shape (no lookupObject) — the UI Events
-    // Framework's phoneContext.publish() path (Oracle's documented sample
-    // for this event) isn't usable here: window.CX_SVC_UI_EVENTS_FRAMEWORK
-    // is confirmed absent — this bridge runs inside WxCC Desktop's own
-    // document, not inside an Oracle-hosted page/iframe, so that global is
-    // never injected. window.svcMca.tlb.api is the only transport available.
+
     this.api.newCommEvent(
       MCA_CHANNEL,
       MCA_APP_CLASSIFICATION,

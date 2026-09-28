@@ -152,6 +152,22 @@ function extractOutboundCallInfo(payload: unknown): { callId: string; ani: strin
   };
 }
 
+/**
+ * Pulls the wrap-up code (WxCC's wrapUpAuxCodeId) out of eAgentContactWrappedUp's
+ * raw payload, to forward as Oracle's CommReasonCd/ResolutionCd on closeCommEvent
+ * (per https://docs.oracle.com/en/cloud/saas/sales/faaps/op-wrapups-post.html).
+ * Confirmed against a live payload: it sits directly on detail.data.wrapUpAuxCodeId
+ * (capital "Up"), not nested under interaction. The other spots are kept as
+ * fallbacks in case the shape varies.
+ */
+function extractWrapupCode(detail: unknown): string {
+  const d = detail as {
+    data?: { wrapUpAuxCodeId?: string; interaction?: { wrapUpAuxCodeId?: string } };
+    wrapUpAuxCodeId?: string;
+  };
+  return d?.data?.wrapUpAuxCodeId ?? d?.data?.interaction?.wrapUpAuxCodeId ?? d?.wrapUpAuxCodeId ?? "";
+}
+
 /** Best-effort — see the NOTE at the eScreenPop listener for confidence level. */
 function extractScreenPopInfo(detail: unknown): { name: string; url: string } {
   const d = detail as { data?: { screenPopName?: string; screenPopUrl?: string } };
@@ -216,6 +232,13 @@ function toMcaInData(info: ContactInfo, forNewCommEvent = false): Record<string,
 class WxCCService {
   private stateListeners: StateChangeListener[] = [];
   private activeCall: ActiveCall | null = null;
+  // Set while an Oracle-initiated outbound call's startOutdial is in
+  // flight (see registerOutboundCallHandler). Oracle can send a command
+  // (typically disconnect, if the agent cancels while it's still dialing)
+  // keyed by its own call id before startOutdial resolves with WxCC's real
+  // interactionId — without waiting on this, that command would fire
+  // against Oracle's placeholder id instead of a real WxCC task and 404.
+  private pendingOutdial: { callId: string; promise: Promise<void> } | null = null;
 
   async init(): Promise<void> {
     log.info("Initializing WxCC Desktop SDK…");
@@ -270,6 +293,7 @@ class WxCCService {
   private registerWxCCEvents(): void {
     const handleOfferContact = (source: string, detail: unknown) => {
       log.debug(`${source} raw payload`, detail);
+      oracleMca.logWebexEvent(source, detail);
       const info = extractContactInfo(detail);
       if (!info.interactionId) {
         log.warn(`${source}: no interactionId in payload — cannot offer contact`, detail);
@@ -328,6 +352,7 @@ class WxCCService {
     // the same call.
     const connectContact = (source: string, detail: unknown) => {
       log.debug(`${source} raw payload`, detail);
+      oracleMca.logWebexEvent(source, detail);
       const info = extractContactInfo(detail);
       const fromEvent = info.interactionId;
       if (!this.activeCall) {
@@ -395,6 +420,7 @@ class WxCCService {
 
     Desktop.agentContact.addEventListener("eAgentContactHeld", (detail: Service.Aqm.Contact.AgentContact) => {
       log.debug("eAgentContactHeld raw payload", detail);
+      oracleMca.logWebexEvent("eAgentContactHeld", detail);
       const { interactionId } = extractContactInfo(detail);
       if (!this.activeCall) {
         log.warn("eAgentContactHeld: no active call tracked — ignoring", { interactionId });
@@ -412,6 +438,7 @@ class WxCCService {
 
     Desktop.agentContact.addEventListener("eAgentContactUnHeld", (detail: Service.Aqm.Contact.AgentContact) => {
       log.debug("eAgentContactUnHeld raw payload", detail);
+      oracleMca.logWebexEvent("eAgentContactUnHeld", detail);
       const { interactionId } = extractContactInfo(detail);
       if (!this.activeCall) {
         log.warn("eAgentContactUnHeld: no active call tracked — ignoring", { interactionId });
@@ -425,6 +452,7 @@ class WxCCService {
 
     Desktop.agentContact.addEventListener("eAgentWrapup", (detail: Service.Aqm.Contact.AgentContact) => {
       log.debug("eAgentWrapup raw payload", detail);
+      oracleMca.logWebexEvent("eAgentWrapup", detail);
       const { interactionId } = extractContactInfo(detail);
       if (!this.activeCall) {
         log.warn("eAgentWrapup: no active call tracked — ignoring", { interactionId });
@@ -447,6 +475,7 @@ class WxCCService {
     // mandatory call — actually needs to fire for this org.
     Desktop.agentContact.addEventListener("eAgentContactWrappedUp", (detail: unknown) => {
       log.debug("eAgentContactWrappedUp raw payload", detail);
+      oracleMca.logWebexEvent("eAgentContactWrappedUp", detail);
       const info = extractContactInfo(detail);
       if (!this.activeCall) {
         log.warn("eAgentContactWrappedUp: no active call tracked — ignoring", { interactionId: info.interactionId });
@@ -454,14 +483,23 @@ class WxCCService {
       }
       const interactionId = info.interactionId || this.activeCall.interactionId;
       const duration = Math.round((Date.now() - this.activeCall.startedAt.getTime()) / 1000);
-      log.info("eAgentContactWrappedUp", { interactionId, duration });
-      oracleMca.closeCommEvent(this.activeCall.oracleEventId, { ...toMcaInData(this.activeCall), duration: String(duration) });
+      const wrapupAuxCodeId = extractWrapupCode(detail);
+      if (!wrapupAuxCodeId) {
+        log.warn("eAgentContactWrappedUp: no wrapupAuxCodeId in payload — CommReasonCd/ResolutionCd will be omitted", { interactionId });
+      }
+      log.info("eAgentContactWrappedUp", { interactionId, duration, wrapupAuxCodeId });
+      oracleMca.closeCommEvent(this.activeCall.oracleEventId, {
+        ...toMcaInData(this.activeCall),
+        duration: String(duration),
+        ...(wrapupAuxCodeId ? { CommReasonCd: wrapupAuxCodeId, ResolutionCd: wrapupAuxCodeId } : {}),
+      });
       this.activeCall = null;
       this.notify("idle");
     });
 
     Desktop.agentContact.addEventListener("eAgentContactEnded", (detail: Service.Aqm.Contact.AgentContact) => {
       log.debug("eAgentContactEnded raw payload", detail);
+      oracleMca.logWebexEvent("eAgentContactEnded", detail);
       const { interactionId } = extractContactInfo(detail);
       // Confirmed by testing: in this org, eAgentContactEnded fires the
       // moment the call itself disconnects — BEFORE wrap-up starts, not
@@ -477,6 +515,7 @@ class WxCCService {
 
     Desktop.screenpop.addEventListener("eScreenPop", (detail: unknown) => {
       log.debug("eScreenPop raw payload", detail);
+      oracleMca.logWebexEvent("eScreenPop", detail);
       if (!this.activeCall) return;
       // NOTE: field names (screenPopName/screenPopUrl) are best-effort,
       // taken from a Cisco sample rather than confirmed against a live
@@ -504,12 +543,14 @@ class WxCCService {
     DIAGNOSTIC_EVENTS.forEach((eventName) => {
       Desktop.agentContact.addEventListener(eventName, (detail: unknown) => {
         log.info(`[diagnostic] ${eventName} fired`, detail);
+        oracleMca.logWebexEvent(eventName, detail);
       });
     });
 
     // Listen for agent channel state changes from WxCC and notify Oracle via agentStateEvent.
     Desktop.agentStateInfo.addEventListener("eAgentChannelStateChanged", (detail: unknown) => {
       log.debug("eAgentChannelStateChanged raw payload", detail);
+      oracleMca.logWebexEvent("eAgentChannelStateChanged", detail);
       const d = detail as {
         data?: {
           agentId?: string;
@@ -539,6 +580,7 @@ class WxCCService {
     // which updates latestData and emits "updated" on agentStateInfo.
     Desktop.agentStateInfo.addEventListener("updated", (changes: unknown) => {
       log.debug("agentStateInfo 'updated' raw payload", changes);
+      oracleMca.logWebexEvent("agentStateInfo.updated", changes);
       const changeList = changes as Array<{ name?: string; value?: unknown }>;
       if (Array.isArray(changeList)) {
         const hasStateChange = changeList.some(
@@ -552,11 +594,13 @@ class WxCCService {
 
     Desktop.agentStateInfo.addEventListener("eAgentReloginSuccess", (detail: unknown) => {
       log.debug("eAgentReloginSuccess raw payload", detail);
+      oracleMca.logWebexEvent("eAgentReloginSuccess", detail);
       this.sendAgentState("eAgentReloginSuccess");
     });
 
     Desktop.agentStateInfo.addEventListener("eAgentChannelReloginSuccess", (detail: unknown) => {
       log.debug("eAgentChannelReloginSuccess raw payload", detail);
+      oracleMca.logWebexEvent("eAgentChannelReloginSuccess", detail);
       this.sendAgentState("eAgentChannelReloginSuccess");
     });
 
@@ -569,6 +613,7 @@ class WxCCService {
       if (typeof agentService.eAgentStateChangeSuccess?.listen === "function") {
         agentService.eAgentStateChangeSuccess.listen((payload: any) => {
           log.info("[direct AQM] eAgentStateChangeSuccess fired", payload);
+          oracleMca.logWebexEvent("direct AQM eAgentStateChangeSuccess", payload);
           const data = payload?.data;
           this.sendAgentState("direct AQM eAgentStateChangeSuccess", {
             status: data?.status,
@@ -582,6 +627,7 @@ class WxCCService {
       if (typeof agentService.eAgentStationLoginSuccess?.listen === "function") {
         agentService.eAgentStationLoginSuccess.listen((payload: any) => {
           log.info("[direct AQM] eAgentStationLoginSuccess fired", payload);
+          oracleMca.logWebexEvent("direct AQM eAgentStationLoginSuccess", payload);
           const data = payload?.data;
           this.sendAgentState("direct AQM eAgentStationLoginSuccess", {
             status: data?.status,
@@ -595,6 +641,7 @@ class WxCCService {
       if (typeof agentService.eAgentReloginSuccess?.listen === "function") {
         agentService.eAgentReloginSuccess.listen((payload: any) => {
           log.info("[direct AQM] eAgentReloginSuccess fired", payload);
+          oracleMca.logWebexEvent("direct AQM eAgentReloginSuccess", payload);
           const data = payload?.data;
           this.sendAgentState("direct AQM eAgentReloginSuccess", {
             status: data?.status,
@@ -608,6 +655,7 @@ class WxCCService {
       if (typeof agentService.eAgentChannelStateChanged?.listen === "function") {
         agentService.eAgentChannelStateChanged.listen((payload: any) => {
           log.info("[direct AQM] eAgentChannelStateChanged fired", payload);
+          oracleMca.logWebexEvent("direct AQM eAgentChannelStateChanged", payload);
           const data = payload?.data;
           this.sendAgentState("direct AQM eAgentChannelStateChanged", {
             status: data?.state ?? data?.status,
@@ -683,6 +731,27 @@ class WxCCService {
 
   private registerOracleCommands(): void {
     oracleMca.onInteractionCommand(async (cmd: McaInteractionCommand) => {
+      // See pendingOutdial's doc comment — wait for the real interactionId
+      // before translating cmd.eventId below, or this races against a
+      // still-placeholder id and 404s calling into the WxCC SDK.
+      const pendingOutdial = this.pendingOutdial;
+      if (pendingOutdial !== null && pendingOutdial.callId === cmd.eventId) {
+        log.debug(`${cmd.command}: waiting for outdial placement to resolve before dispatching`, {
+          eventId: cmd.eventId,
+        });
+        await pendingOutdial.promise;
+      }
+
+      // No call tracked at all — e.g. Oracle cancelling a dial it never
+      // told us about via onOutgoingEvent (that event not firing at all is
+      // an Oracle-side admin/config issue, not something this bridge can
+      // work around). Fail fast instead of falling through to cmd.eventId
+      // below and calling the WxCC SDK with an id for a call that was
+      // never actually placed.
+      if (!this.activeCall) {
+        throw new Error(`${cmd.command}: no active call tracked for eventId ${cmd.eventId ?? "(none)"}`);
+      }
+
       // Oracle echoes back whatever id we gave it (oracleEventId) — for an
       // outbound call placed via onOutgoingEvent, that's Oracle's own call
       // id, not WxCC's real interactionId, so translate back before calling
@@ -818,38 +887,46 @@ class WxCCService {
         channel: MCA_CHANNEL,
       });
 
-      try {
-        const contact = await Desktop.dialer.startOutdial({
-          data: {
-            entryPointId: OUTDIAL_ENTRY_POINT_ID,
-            destination: stripLeadingPlus(ani),
-            direction: "OUTBOUND",
-            attributes: {},
-            mediaType: "telephony",
-            outboundType: "OUTDIAL",
-          },
-        });
-        // Still the call we started (not superseded/cleared by a race) —
-        // only then is it safe to fill in the real interactionId.
-        if (this.activeCall?.oracleEventId !== callId) return;
-        const resolvedId = contact ? extractContactInfo(contact).interactionId : "";
-        if (resolvedId) {
-          this.activeCall = { ...this.activeCall, interactionId: resolvedId };
-          log.info("onOutgoingEvent: outdial placed", { callId, interactionId: resolvedId });
-        } else {
-          log.warn(
-            "onOutgoingEvent: startOutdial resolved without a usable interactionId — relying on the connect-signal handler's fallback-to-tracked-call matching",
-            { callId, contact }
-          );
+      // Tracked so registerOracleCommands can await it before dispatching a
+      // command Oracle sends for this call (keyed by callId) while it's
+      // still in flight — see pendingOutdial's doc comment.
+      const outdialPromise = (async () => {
+        try {
+          const contact = await Desktop.dialer.startOutdial({
+            data: {
+              entryPointId: OUTDIAL_ENTRY_POINT_ID,
+              destination: stripLeadingPlus(ani),
+              direction: "OUTBOUND",
+              attributes: {},
+              mediaType: "telephony",
+              outboundType: "OUTDIAL",
+            },
+          });
+          // Still the call we started (not superseded/cleared by a race) —
+          // only then is it safe to fill in the real interactionId.
+          if (this.activeCall?.oracleEventId !== callId) return;
+          const resolvedId = contact ? extractContactInfo(contact).interactionId : "";
+          if (resolvedId) {
+            this.activeCall = { ...this.activeCall, interactionId: resolvedId };
+            log.info("onOutgoingEvent: outdial placed", { callId, interactionId: resolvedId });
+          } else {
+            log.warn(
+              "onOutgoingEvent: startOutdial resolved without a usable interactionId — relying on the connect-signal handler's fallback-to-tracked-call matching",
+              { callId, contact }
+            );
+          }
+        } catch (err) {
+          log.error("onOutgoingEvent: startOutdial failed", errInfo(err));
+          if (this.activeCall?.oracleEventId === callId) {
+            oracleMca.outboundCommError(callId, errInfo(err).message);
+            this.activeCall = null;
+            this.notify("error");
+          }
+        } finally {
+          if (this.pendingOutdial?.callId === callId) this.pendingOutdial = null;
         }
-      } catch (err) {
-        log.error("onOutgoingEvent: startOutdial failed", errInfo(err));
-        if (this.activeCall?.oracleEventId === callId) {
-          oracleMca.outboundCommError(callId, errInfo(err).message);
-          this.activeCall = null;
-          this.notify("error");
-        }
-      }
+      })();
+      this.pendingOutdial = { callId, promise: outdialPromise };
     });
   }
 
