@@ -3,9 +3,17 @@ import type {
   McaInteractionCommand,
   McaResult,
   McaToolbarApiMethods,
+  McaUiEventsFrameworkProvider,
 } from "../types/oracle-mca";
-import { MCA_APP_CLASSIFICATION, MCA_CHANNEL, MCA_CHANNEL_TYPE } from "../types/oracle-mca";
+import { MCA_APP_CLASSIFICATION, MCA_ATTR, MCA_CHANNEL, MCA_CHANNEL_TYPE, MCA_DIRECTION_OUTBOUND } from "../types/oracle-mca";
 import { log, errInfo } from "./logger";
+
+// Oracle's UI Events Framework loader — a fixed, generic entry point (not
+// org-specific like oraApiSource). It self-resolves its own versioned
+// "core" client at load time via a postMessage handshake with
+// window.parent, confirmed by loading and reading this exact script.
+const UI_EVENTS_FRAMEWORK_SRC = "https://static.oracle.com/cdn/ui-events-framework/libs/ui-events-framework-client.js";
+const UI_EVENTS_FRAMEWORK_APP_NAME = "WxCCOracleBridge";
 
 type InteractionCommandHandler = (cmd: McaInteractionCommand) => void | Promise<void>;
 type AgentCommandHandler = (cmd: McaAgentCommand) => void | Promise<void>;
@@ -36,18 +44,44 @@ class OracleMcaService {
   // WxCCService calls all three).
   private pendingOutData = new Map<string, Record<string, string>>();
 
+  // WrapUp Synchronization (see syncWrapUpFields) — the UI Events
+  // Framework provider, loaded and initialized independently of
+  // window.svcMca.tlb.api (see initUiEventsFramework). null until that
+  // finishes (or if it fails), in which case syncWrapUpFields just
+  // no-ops rather than blocking anything on the main MCA flow.
+  private uiEventsProvider: McaUiEventsFrameworkProvider | null = null;
+
+  /**
+   * oraApiSource is sometimes missing from window.location.search on this
+   * widget's very first load — reloading the WxCC side alone (without any
+   * other change) has been observed to fix it, which points to Oracle's
+   * toolbar frame finishing its own URL setup slightly after this script
+   * starts, not a real "not embedded by Oracle" case. Retries a few times
+   * before giving up, instead of failing permanently on what's likely just
+   * a startup race.
+   */
+  private async waitForApiSource(maxAttempts = 10, intervalMs = 500): Promise<string | null> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      log.info("Oracle MCA: window.location", window.location.href);
+      const params = new URLSearchParams(window.location.search);
+      const apiSource = params.get("oraApiSource");
+      const parentFrame = params.get("oraParentFrame");
+      const toolbarName = params.get("oraTbName");
+      log.info("Oracle MCA: config from URL", { attempt, apiSource, parentFrame, toolbarName });
+
+      if (apiSource) return apiSource;
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      }
+    }
+    return null;
+  }
+
   async init(): Promise<void> {
-    log.info("Oracle MCA: window.location", window.location.href);
-
-    const params = new URLSearchParams(window.location.search);
-    const apiSource = params.get("oraApiSource");
-    const parentFrame = params.get("oraParentFrame");
-    const toolbarName = params.get("oraTbName");
-    log.info("Oracle MCA: config from URL", { apiSource, parentFrame, toolbarName });
-
+    const apiSource = await this.waitForApiSource();
     if (!apiSource) {
       log.error(
-        "Oracle MCA: oraApiSource missing from window.location.search — cannot load Oracle's toolbar library. This widget may not be embedded by Oracle's Media Toolbar right now (e.g. running standalone)."
+        "Oracle MCA: oraApiSource missing from window.location.search after retrying — cannot load Oracle's toolbar library. This widget may not be embedded by Oracle's Media Toolbar right now (e.g. running standalone)."
       );
       return;
     }
@@ -78,6 +112,49 @@ class OracleMcaService {
     this.api.readyForOperation(true, (res) => {
       log.info("Oracle MCA: readyForOperation acknowledged", res);
     });
+
+    // Fire-and-forget: entirely independent of window.svcMca.tlb.api above
+    // (different script, different global) — a failure here must never
+    // affect call handling, only WrapUp Synchronization (syncWrapUpFields).
+    void this.initUiEventsFramework();
+  }
+
+  /**
+   * Loads and initializes Oracle's UI Events Framework (see oracle-mca.ts
+   * for why this is a second, separate library from window.svcMca.tlb.api).
+   * Best-effort: any failure just leaves uiEventsProvider null and logs,
+   * same pattern as the rest of this file's UNVERIFIED integrations.
+   */
+  private async initUiEventsFramework(): Promise<void> {
+    try {
+      await this.loadScript(UI_EVENTS_FRAMEWORK_SRC);
+    } catch (err) {
+      log.error("Oracle UI Events Framework: failed to load client script", errInfo(err));
+      return;
+    }
+    if (!window.CX_SVC_UI_EVENTS_FRAMEWORK?.uiEventsFramework) {
+      log.error(
+        "Oracle UI Events Framework: script loaded but window.CX_SVC_UI_EVENTS_FRAMEWORK.uiEventsFramework is undefined"
+      );
+      return;
+    }
+    try {
+      this.uiEventsProvider = await window.CX_SVC_UI_EVENTS_FRAMEWORK.uiEventsFramework.initialize(
+        UI_EVENTS_FRAMEWORK_APP_NAME,
+        "v1"
+      );
+      log.info("Oracle UI Events Framework: initialized", {
+        applicationName: UI_EVENTS_FRAMEWORK_APP_NAME,
+        // getRecordContext (per Oracle's docs) turned out not to exist on
+        // the real object — dumping every method name (own + inherited)
+        // here so the actual provider shape is visible in the logs instead
+        // of guessing again from docs that don't match this build.
+        ownKeys: Object.keys(this.uiEventsProvider as object),
+        prototypeMethods: Object.getOwnPropertyNames(Object.getPrototypeOf(this.uiEventsProvider)),
+      });
+    } catch (err) {
+      log.error("Oracle UI Events Framework: initialize() failed", errInfo(err));
+    }
   }
 
   private loadScript(src: string): Promise<void> {
@@ -210,7 +287,13 @@ class OracleMcaService {
   newCommEvent(eventId: string, inData: Record<string, string>): void {
     if (!this.api) return;
 
-    const fullInData = { callStatus: "INCOMING", ...inData };
+    // Per Oracle's newCommEvent doc, callStatus is only ever shown set to
+    // "INCOMING" (and is optional even there). Its outbound-call sample
+    // (handle-outbound-calls.html) doesn't set callStatus at all — so it's
+    // omitted for outbound rather than guessing at an "OUTGOING"/"DIALING"
+    // value Oracle's docs never mention.
+    const isOutbound = inData[MCA_ATTR.COMMUNICATION_DIRECTION] === MCA_DIRECTION_OUTBOUND;
+    const fullInData = { ...(isOutbound ? {} : { callStatus: "INCOMING" }), ...inData };
     log.info("→ Oracle: newCommEvent", { eventId, inData: fullInData });
 
     this.api.newCommEvent(
@@ -276,9 +359,78 @@ class OracleMcaService {
       eventId,
       fullInData,
       reason,
-      this.withTimeoutWarning("closeCommEvent", eventId, (res) => log.info("closeCommEvent response", res)),
+      this.withTimeoutWarning("closeCommEvent", eventId, (res) => {
+        log.info("closeCommEvent response", res);
+        // Best-effort WrapUp Synchronization: window.svcMca.tlb.api's own
+        // closeCommEvent (above) already carries ResolutionCd/CommReasonCd,
+        // but Oracle isn't applying those to the actual WrapUp record on
+        // this org — confirmed by a live response where they're echoed
+        // back with result:"success" yet never land on the record. That
+        // response does hand back the real WrapUp record id though
+        // (wrapupId / outData.SVCMCA_WRAPUP_ID), so the same value is
+        // mirrored here through the separate UI Events Framework's Set
+        // Field Value operation instead. Purely additive: the inData path
+        // above is unchanged either way, and this never throws.
+        const wrapupId =
+          (res as { wrapupId?: string } | undefined)?.wrapupId ??
+          (res as { outData?: { SVCMCA_WRAPUP_ID?: string } } | undefined)?.outData?.SVCMCA_WRAPUP_ID;
+        if (wrapupId && fullInData.ResolutionCd) {
+          void this.syncWrapUpFields(eventId, wrapupId, { ResolutionCd: fullInData.ResolutionCd });
+        } else if (fullInData.ResolutionCd) {
+          log.warn("closeCommEvent response: no wrapupId found — cannot sync WrapUp fields", { eventId });
+        }
+      }),
       MCA_CHANNEL_TYPE
     );
+  }
+
+  /**
+   * Publishes WrapUp field values (e.g. "ResolutionCd", "CallNotes" —
+   * without the "WrapUp." prefix, which this method adds) through Oracle's
+   * UI Events Framework.
+   *
+   * getRecordContext (per Oracle's docs) does NOT exist on this build's
+   * provider — confirmed by dumping its real method list, which has
+   * getActiveEngagements instead. This looks for the engagement matching
+   * this eventId and, since that engagement's shape isn't documented
+   * either, dumps whatever it finds so the actual path to a
+   * publish()-able WrapUp context can be confirmed from real data rather
+   * than guessed again.
+   *
+   * Best-effort and non-blocking by design: if the framework never
+   * initialized, or any step here fails, this just logs and returns rather
+   * than throwing — it's additional to, not a replacement for, the
+   * existing closeCommEvent inData fields.
+   */
+  private async syncWrapUpFields(eventId: string, wrapupId: string, fields: Record<string, string>): Promise<void> {
+    if (!this.uiEventsProvider) {
+      log.warn("syncWrapUpFields: UI Events Framework not initialized — skipping", { eventId, wrapupId, fields });
+      return;
+    }
+    try {
+      const engagements = (await this.uiEventsProvider.getActiveEngagements()) as Array<Record<string, unknown>>;
+      log.info("syncWrapUpFields: getActiveEngagements() result", { eventId, wrapupId, engagements });
+
+      const match = engagements.find(
+        (e) => e.eventId === eventId || e.engagementId === eventId || e.interactionId === eventId
+      );
+      if (!match) {
+        log.warn("syncWrapUpFields: no active engagement matched this eventId — skipping", {
+          eventId,
+          wrapupId,
+          fields,
+        });
+        return;
+      }
+      log.info("syncWrapUpFields: matched engagement — dumping its shape to find the WrapUp context path", {
+        eventId,
+        wrapupId,
+        ownKeys: Object.keys(match),
+        prototypeMethods: Object.getOwnPropertyNames(Object.getPrototypeOf(match)),
+      });
+    } catch (err) {
+      log.error("syncWrapUpFields: failed", { eventId, wrapupId, fields }, errInfo(err));
+    }
   }
 
   /** Reports that placing an agent-initiated outbound call (from onOutgoingEvent) failed. */

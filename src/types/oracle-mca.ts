@@ -215,8 +215,60 @@ export interface McaToolbarApiMethods {
   ): void;
 }
 
+/**
+ * Oracle's separate, parallel "UI Events Framework" — NOT part of
+ * window.svcMca.tlb.api above. Confirmed (by loading and reading the real
+ * loader script at UI_EVENTS_FRAMEWORK_SRC in OracleMcaService) that its
+ * true global is `window.CX_SVC_UI_EVENTS_FRAMEWORK.uiEventsFramework`,
+ * which self-resolves and loads its own versioned "core" client via a
+ * postMessage handshake with window.parent (FETCH_BUILD_INFO) — this only
+ * works embedded inside Oracle's own frame, same as window.svcMca.tlb.
+ *
+ * `initialize()` and `requestHelper`/`field().setValue()`/`publish()` are
+ * transcribed from Oracle's docs (fuief/initialize-ui-events-framework.html,
+ * fuief/iuieventsframeworkprovider.html, fuief/wrapup-synchronization.html)
+ * — NOT read from the core client's source (it's fetched dynamically at
+ * runtime via the postMessage handshake, so it isn't available to inspect
+ * ahead of time). `requestHelper` and `getActiveEngagements` are confirmed
+ * present (dumped from a live provider instance — see OracleMcaService's
+ * initUiEventsFramework log). The docs' own `getRecordContext` does NOT
+ * exist on this build and was removed here after a live TypeError
+ * confirmed it — getActiveEngagements is the real path being tried
+ * instead, still being confirmed engagement-shape by engagement-shape
+ * (see syncWrapUpFields).
+ */
+export interface McaFieldValueRequest {
+  setValue(name: string, value: string): void;
+}
+
+export interface McaSetFieldValueRequest {
+  field(): McaFieldValueRequest;
+}
+
+export interface McaRecordContext {
+  publish(request: McaSetFieldValueRequest): Promise<unknown>;
+}
+
+export interface McaUiEventsRequestHelper {
+  createPublishRequest(operationName: string): McaSetFieldValueRequest;
+}
+
+export interface McaUiEventsFrameworkProvider {
+  requestHelper: McaUiEventsRequestHelper;
+  /** Return shape UNCONFIRMED beyond "an array" — see syncWrapUpFields. */
+  getActiveEngagements(): Promise<unknown[]>;
+}
+
+export interface McaUiEventsFrameworkLoader {
+  uiEventsFramework: {
+    initialize(applicationName: string, version?: string): Promise<McaUiEventsFrameworkProvider>;
+  };
+}
+
 declare global {
   interface Window {
     svcMca?: { tlb: McaToolbarApi };
+    /** Confirmed global name — read directly from the loader script's own source. */
+    CX_SVC_UI_EVENTS_FRAMEWORK?: McaUiEventsFrameworkLoader;
   }
 }

@@ -36,6 +36,8 @@ export interface ActiveCall {
   dnis: string;
   queueName: string;
   callData: Record<string, string>;
+  /** From ContactInfo.direction — "INBOUND" or "OUTBOUND". */
+  direction: string;
   startedAt: Date;
   state: CallState;
 }
@@ -68,6 +70,7 @@ interface WxCCContactEventDetail {
         virtualTeamName?: string; // queue name
       };
       callAssociatedData?: Record<string, { value?: string } | string | undefined>;
+      contactDirection?: { type?: string };
     };
   };
 }
@@ -78,11 +81,13 @@ interface ContactInfo {
   dnis: string;
   queueName: string;
   callData: Record<string, string>;
+  /** From data.interaction.contactDirection.type — "INBOUND" or "OUTBOUND". */
+  direction: string;
 }
 
 /**
- * Pulls interactionId/ani/dnis/queueName/callData out of a raw WxCC
- * contact event detail. Tries the confirmed nested shape first, falls
+ * Pulls interactionId/ani/dnis/queueName/callData/direction out of a raw
+ * WxCC contact event detail. Tries the confirmed nested shape first, falls
  * back to a flat shape in case some event type turns out to differ —
  * cheap insurance, not a claim that the flat shape is real anywhere.
  */
@@ -90,7 +95,13 @@ function extractContactInfo(detail: unknown): ContactInfo {
   const d = detail as WxCCContactEventDetail;
   const interaction = d?.data?.interaction;
   const details = interaction?.callAssociatedDetails;
-  const flat = detail as { ani?: string; dnis?: string; queueName?: string; callData?: Record<string, string> };
+  const flat = detail as {
+    ani?: string;
+    dnis?: string;
+    queueName?: string;
+    callData?: Record<string, string>;
+    direction?: string;
+  };
 
   const callData: Record<string, string> = {};
   const cad = interaction?.callAssociatedData;
@@ -107,6 +118,7 @@ function extractContactInfo(detail: unknown): ContactInfo {
     dnis: details?.dn ?? flat?.dnis ?? "",
     queueName: details?.virtualTeamName ?? flat?.queueName ?? "",
     callData: Object.keys(callData).length > 0 ? callData : (flat?.callData ?? {}),
+    direction: interaction?.contactDirection?.type ?? flat?.direction ?? "",
   };
 }
 
@@ -168,6 +180,27 @@ function extractWrapupCode(detail: unknown): string {
   return d?.data?.wrapUpAuxCodeId ?? d?.data?.interaction?.wrapUpAuxCodeId ?? d?.wrapUpAuxCodeId ?? "";
 }
 
+/**
+ * Maps WxCC's wrapUpAuxCodeId (a GUID) to the short label Oracle's
+ * CommReasonCd/ResolutionCd actually accepts — the GUID itself is too long
+ * for those fields. Falls back to the raw GUID if it's not in this table
+ * (better than silently dropping it, even though Oracle will likely reject
+ * that too — makes an unmapped code visible in the logs instead of just
+ * missing).
+ */
+const WRAPUP_CODE_TO_RESOLUTION_CD: Record<string, string> = {
+  "0a13ba43-eed1-4723-9b3b-01a3c6036543": "Call_Back_Later",
+  "85eb5a0f-0fc8-4fd7-8670-a5d9d2427ad3": "Left_Voicemail",
+  "105d5413-3e12-44ad-bcc2-bc164657ca41": "Meaningful_Connect",
+  "fe976704-cc96-44e1-aec5-d989c3652aba": "Not_Interested",
+  "13401183-ca8c-4dd2-9062-46f5fb87cc78": "Unqualified",
+  "acf27d2c-4aea-4a29-881a-7c5cd0c016ff": "zDefaultCallWrap",
+};
+
+function toResolutionCd(wrapupAuxCodeId: string): string {
+  return WRAPUP_CODE_TO_RESOLUTION_CD[wrapupAuxCodeId] ?? wrapupAuxCodeId;
+}
+
 /** Best-effort — see the NOTE at the eScreenPop listener for confidence level. */
 function extractScreenPopInfo(detail: unknown): { name: string; url: string } {
   const d = detail as { data?: { screenPopName?: string; screenPopUrl?: string } };
@@ -193,19 +226,21 @@ function getAgentxService(): any {
  *   OracleMcaService merges into the following startCommEvent/closeCommEvent
  *   (see pendingOutData) — sending our own value up front would just be a
  *   guess ahead of the one Oracle hands back.
- * - SVCMCA_COMMUNICATION_DIRECTION is set: this widget only ever offers
- *   inbound calls to newCommEvent.
+ * - SVCMCA_COMMUNICATION_DIRECTION is set from the WxCC event's own
+ *   contactDirection.type (see ContactInfo.direction), falling back to
+ *   inbound if that's ever missing — sent on all three calls, not just
+ *   newCommEvent, since Oracle's later calls don't reliably inherit it
+ *   from newCommEvent's outData.
  */
-function toMcaInData(info: ContactInfo, forNewCommEvent = false): Record<string, string> {
+function toMcaInData(info: ContactInfo | ActiveCall, forNewCommEvent = false): Record<string, string> {
   const inData: Record<string, string> = {
     [MCA_ATTR.ANI]: stripLeadingPlus(info.ani),
     [MCA_ATTR.DNIS]: info.dnis,
     [MCA_ATTR.QUEUE]: info.queueName,
     channel: MCA_CHANNEL,
+    [MCA_ATTR.COMMUNICATION_DIRECTION]: info.direction === "OUTBOUND" ? MCA_DIRECTION_OUTBOUND : MCA_DIRECTION_INBOUND,
   };
-  if (forNewCommEvent) {
-    inData[MCA_ATTR.COMMUNICATION_DIRECTION] = MCA_DIRECTION_INBOUND;
-  } else {
+  if (!forNewCommEvent) {
     // Per Oracle guidance: IMcaStartCommInData's "standard parameters"
     // (interactionId, channel) should be explicit inData keys, not just
     // the positional eventId/channel args the API call already takes —
@@ -474,7 +509,7 @@ class WxCCService {
     // eAgentContactEnded. This is where closeCommEvent — Oracle's other
     // mandatory call — actually needs to fire for this org.
     Desktop.agentContact.addEventListener("eAgentContactWrappedUp", (detail: unknown) => {
-      log.debug("eAgentContactWrappedUp raw payload", detail);
+      log.debug(" raw payload", detail);
       oracleMca.logWebexEvent("eAgentContactWrappedUp", detail);
       const info = extractContactInfo(detail);
       if (!this.activeCall) {
@@ -487,12 +522,23 @@ class WxCCService {
       if (!wrapupAuxCodeId) {
         log.warn("eAgentContactWrappedUp: no wrapupAuxCodeId in payload — CommReasonCd/ResolutionCd will be omitted", { interactionId });
       }
-      log.info("eAgentContactWrappedUp", { interactionId, duration, wrapupAuxCodeId });
-      oracleMca.closeCommEvent(this.activeCall.oracleEventId, {
-        ...toMcaInData(this.activeCall),
-        duration: String(duration),
-        ...(wrapupAuxCodeId ? { CommReasonCd: wrapupAuxCodeId, ResolutionCd: wrapupAuxCodeId } : {}),
-      });
+      const resolutionCd = wrapupAuxCodeId ? toResolutionCd(wrapupAuxCodeId) : "";
+      log.info("eAgentContactWrappedUp", { interactionId, duration, wrapupAuxCodeId, resolutionCd });
+      oracleMca.closeCommEvent(
+        this.activeCall.oracleEventId,
+        {
+          ...toMcaInData(this.activeCall),
+          duration: String(duration),
+          ...(resolutionCd ? { CommReasonCd: resolutionCd, ResolutionCd: resolutionCd } : {}),
+        },
+        // Per Oracle's handle-outbound-calls doc: closeCommEvent's reason
+        // is "WRAPUP" when the call was disconnected by the agent/customer
+        // and wrapped up normally — this is the only closeCommEvent path
+        // in this app (see eAgentContactEnded's comment above), so it's
+        // always this case, never "REJECT" (a rejected/RONA'd offer never
+        // reaches an active call, so closeCommEvent never fires for it).
+        "WRAPUP"
+      );
       this.activeCall = null;
       this.notify("idle");
     });
@@ -877,6 +923,7 @@ class WxCCService {
         dnis: "",
         queueName: "",
         callData: {},
+        direction: "OUTBOUND",
         startedAt: new Date(),
         state: "incoming",
       };
