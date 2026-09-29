@@ -1,23 +1,30 @@
-// Oracle Fusion Service "MCA" (Multichannel Architecture) toolbar protocol.
+// Oracle Fusion Service "UI Events Framework" (fuief) — the call-control
+// integration this widget actually uses.
 //
-// This is Oracle's real, documented integration surface — not a custom
-// protocol. When Oracle embeds a CTI toolbar iframe, it passes the URL of
-// its own client library via a query param (`oraApiSource`); the toolbar
-// is expected to load that exact script and call its methods, rather than
-// inventing its own postMessage format. Confirmed against:
-//   - Oracle's official docs: https://docs.oracle.com/en/cloud/saas/fusion-service/faiec/overview-of-interaction-apis.html
-//     and https://docs.oracle.com/en/cloud/saas/fusion-service/fuief/{startcommevent,newcommevent}.html
-//   - The library source itself, downloaded and read directly (not via a
-//     lossy summarizer) at oj-mca/2607.10.260931029/.../mcaInteractionV1.js.
-//     The shape below (methods under `.api`, `closeCommEvent`'s `reason`
-//     param, `onToolbarAgentCommand`'s channel args, self-initializing at
-//     script-load time) is transcribed straight from that source, not
-//     inferred.
+// This project previously drove Oracle's older, legacy toolbar library
+// (window.svcMca.tlb.api, loaded via the `oraApiSource` query param) —
+// abandoned because Oracle's org here doesn't apply ResolutionCd/CommReasonCd
+// sent through it to the actual WrapUp record (confirmed live: echoed back
+// with result:"success" but never lands on the record), and there's no way
+// to reach the newer WrapUp Synchronization API from that legacy library —
+// its own engagement tracking (getActiveEngagements) never even sees calls
+// that were run through the old client. See git history for the old
+// implementation if the legacy library is ever needed again.
 //
-// Fields marked UNVERIFIED below are inferred (naming convention) rather
-// than confirmed from an official source — kept as named constants so
-// there's a single place to correct them, and every inbound command is
-// logged raw (see OracleMcaService) so a wrong guess is visible in the// exported logs instead of failing silently.
+// The UI Events Framework's own docs (fuief/*.html) have already proven
+// wrong once in this codebase (a documented `getRecordContext` method does
+// not exist on a live provider instance — confirmed by a TypeError, not a
+// guess), so — beyond the constants above the command types, which are
+// confirmed against Oracle's docs or this app's own live logs — most of
+// what follows is transcribed from docs and verified/corrected against a
+// live provider/phoneContext instance's actual method list (dumped via
+// Object.keys / Object.getOwnPropertyNames(Object.getPrototypeOf(...)) at
+// startup — see OracleMcaService.initUiEventsFramework). Where a specific
+// method is still unconfirmed, request/response objects are typed as
+// `unknown` and accessed through OracleMcaService's callMethod() helper,
+// which checks typeof before calling and only logs+no-ops on a wrong guess
+// instead of throwing — so an incorrect assumption here degrades instead of
+// crashing.
 
 /** This widget is voice-only. */
 export const MCA_CHANNEL = "PHONE";
@@ -111,154 +118,68 @@ export interface McaAgentCommand extends McaCommandBase {
   channelType?: string;
 }
 
-export type McaCallback<T = unknown> = (response: T) => void;
-
 /**
- * window.svcMca.tlb's real shape. Two things that don't match a naive
- * read of the docs:
- *   - `initialize()` runs automatically at script-load time (the file's
- *     own last two lines: `var mcaTlb = new mcaToolbar(); mcaTlb.initialize();`).
- *     Calling it again re-registers the underlying window `message` /
- *     custom-event listeners a second time — every inbound command would
- *     fire twice. Don't call it.
- *   - The actual callable methods live under `.tlb.api.*`, not directly
- *     on `.tlb`.
- */
-export interface McaToolbarApi {
-  /** Auto-invoked by the library itself on load — do not call this again. */
-  initialize(): void;
-  api: McaToolbarApiMethods;
-}
-
-export interface McaToolbarApiMethods {
-  readyForOperation(readiness: boolean, callback?: McaCallback): void;
-  getConfiguration(configType: string | null, callback?: McaCallback): void;
-  /** Matches startCommEvent's arg shape — no lookupObject param, unlike Oracle's docs example. */
-  newCommEvent(
-    channel: string,
-    appClassification: string,
-    eventId: string,
-    inData: Record<string, string>,
-    callback?: McaCallback,
-    channelType?: string
-  ): void;
-  startCommEvent(
-    channel: string,
-    appClassification: string,
-    eventId: string,
-    inData: Record<string, string>,
-    callback?: McaCallback,
-    channelType?: string
-  ): void;
-  /** `reason` sits between `inData` and `callback` — easy to miss. */
-  closeCommEvent(
-    channel: string,
-    appClassification: string,
-    eventId: string,
-    inData: Record<string, string>,
-    reason: string | null,
-    callback?: McaCallback,
-    channelType?: string
-  ): void;
-  invokeScreenPop(
-    channel: string,
-    appClassification: string,
-    eventId: string,
-    pageCode: string,
-    pageData: unknown,
-    callback?: McaCallback,
-    channelType?: string
-  ): void;
-  agentStateEvent(
-    channel: string,
-    eventId: string,
-    isAvailable: boolean,
-    isLoggedIn: boolean,
-    stateCd: string,
-    stateDisplayString: string,
-    reasonCd: string,
-    reasonDisplayString: string,
-    inData: Record<string, string>,
-    callback?: McaCallback,
-    channelType?: string
-  ): void;
-  onToolbarInteractionCommand(executor: (cmd: McaInteractionCommand) => void): void;
-  /** Unlike onToolbarInteractionCommand, this is registered per-channel. */
-  onToolbarAgentCommand(channel: string, channelType: string, executor: (cmd: McaAgentCommand) => void): void;
-  /**
-   * Registered per-channel (confirmed from the library source: the callback
-   * is keyed by `"onOutgoingEvent" + channel` in its internal registry, same
-   * pattern as onToolbarAgentCommand). Fires when the agent initiates an
-   * outbound call from Oracle's own UI (e.g. clicking a phone number).
-   * UNVERIFIED: the shape of the object the executor receives — the library
-   * forwards the raw inbound postMessage payload as-is here (unlike
-   * onToolbarInteractionCommand/onToolbarAgentCommand, which wrap it in a
-   * typed command object with sendResponse) — so field names/nesting are
-   * only confirmed by logging one real firing.
-   */
-  onOutgoingEvent(channel: string, appClassification: string, executor: (payload: unknown) => void, channelType?: string): void;
-  /** Reports an outbound call placement failure back to Oracle. UNVERIFIED beyond the parameter list read from the library source. */
-  outboundCommError(
-    channel: string,
-    commUuid: string,
-    errorCode: string,
-    errorMsg: string,
-    callback?: McaCallback,
-    channelType?: string
-  ): void;
-  interactionControlStateChanged(
-    eventId: string,
-    actionName: string,
-    newInteractionControlStates: unknown[] | undefined,
-    timestamp: number | undefined,
-    inData: Record<string, string> | undefined
-  ): void;
-}
-
-/**
- * Oracle's separate, parallel "UI Events Framework" — NOT part of
- * window.svcMca.tlb.api above. Confirmed (by loading and reading the real
- * loader script at UI_EVENTS_FRAMEWORK_SRC in OracleMcaService) that its
- * true global is `window.CX_SVC_UI_EVENTS_FRAMEWORK.uiEventsFramework`,
- * which self-resolves and loads its own versioned "core" client via a
- * postMessage handshake with window.parent (FETCH_BUILD_INFO) — this only
- * works embedded inside Oracle's own frame, same as window.svcMca.tlb.
+ * IPhoneContext, per fuief/iphonecontext.html — confirmed field-for-field
+ * against that doc page's method list (subscribe/subscribeOnce/publish plus
+ * the getSupportedEvents/getSupportedActions introspection pair, which
+ * OracleMcaService logs at startup specifically to confirm what this org's
+ * build actually supports rather than trusting the docs outright).
  *
- * `initialize()` and `requestHelper`/`field().setValue()`/`publish()` are
- * transcribed from Oracle's docs (fuief/initialize-ui-events-framework.html,
- * fuief/iuieventsframeworkprovider.html, fuief/wrapup-synchronization.html)
- * — NOT read from the core client's source (it's fetched dynamically at
- * runtime via the postMessage handshake, so it isn't available to inspect
- * ahead of time). `requestHelper` and `getActiveEngagements` are confirmed
- * present (dumped from a live provider instance — see OracleMcaService's
- * initUiEventsFramework log). The docs' own `getRecordContext` does NOT
- * exist on this build and was removed here after a live TypeError
- * confirmed it — getActiveEngagements is the real path being tried
- * instead, still being confirmed engagement-shape by engagement-shape
- * (see syncWrapUpFields).
+ * subscribe/subscribeOnce callbacks may return a Promise (required for
+ * onToolbarInteractionCommand/onToolbarAgentCommand, per their own doc
+ * pages) — typed loosely since the two response-reading paths
+ * (onToolbarInteractionCommand vs onToolbarAgentCommand vs onOutgoingEvent)
+ * each read differently-shaped data out of the same `unknown`.
  */
-export interface McaFieldValueRequest {
-  setValue(name: string, value: string): void;
+export interface McaPhoneContext {
+  subscribe(request: unknown, callback: (response: unknown) => unknown): unknown;
+  subscribeOnce(request: unknown, callback: (response: unknown) => unknown): unknown;
+  publish(request: unknown): Promise<unknown>;
+  dispose(): void;
+  getSupportedEvents(): string[];
+  getSupportedActions(): string[];
 }
 
-export interface McaSetFieldValueRequest {
-  field(): McaFieldValueRequest;
+/** IMultiChannelAdaptorContext, per fuief/multichanneladaptorcontext.html. */
+export interface McaMultiChannelAdaptorContext {
+  getCommunicationChannelContext(channelType: string): Promise<McaPhoneContext>;
 }
 
-export interface McaRecordContext {
-  publish(request: McaSetFieldValueRequest): Promise<unknown>;
-}
-
+/**
+ * createPublishRequest/createSubscriptionRequest return type is
+ * intentionally `unknown` rather than a named interface: the confirmed
+ * setters (setEventId, setAppClassification, setReason,
+ * getInData().setInDataValueByAttribute, field().setValue(), setCommUuid,
+ * setErrorCode, setErrorMsg — see fuief/{startcommevent,wrapup-synchronization,
+ * outboundcommerror}.html) differ per operation, and OracleMcaService's
+ * callMethod() helper already guards every call against a method not
+ * existing, so a precise per-operation type would duplicate that safety net
+ * without adding real protection (Oracle's own docs already got
+ * getRecordContext wrong once).
+ */
 export interface McaUiEventsRequestHelper {
-  createPublishRequest(operationName: string): McaSetFieldValueRequest;
+  createPublishRequest(operationName: string): unknown;
+  createSubscriptionRequest(eventName: string): unknown;
 }
 
+/**
+ * IUiEventsFrameworkProvider — confirmed present on a live instance:
+ * requestHelper, getMultiChannelAdaptorContext (dumped from
+ * Object.getOwnPropertyNames(Object.getPrototypeOf(provider)) — see
+ * OracleMcaService.initUiEventsFramework's log).
+ */
 export interface McaUiEventsFrameworkProvider {
   requestHelper: McaUiEventsRequestHelper;
-  /** Return shape UNCONFIRMED beyond "an array" — see syncWrapUpFields. */
-  getActiveEngagements(): Promise<unknown[]>;
+  getMultiChannelAdaptorContext(): Promise<McaMultiChannelAdaptorContext>;
 }
 
+/**
+ * The framework's loader script (fixed URL, not org-specific like the old
+ * `oraApiSource`) — confirmed by loading and reading its actual source: it
+ * self-resolves and loads its own versioned "core" client via a
+ * postMessage handshake with window.parent (`FETCH_BUILD_INFO`), which only
+ * resolves when embedded inside Oracle's own toolbar frame.
+ */
 export interface McaUiEventsFrameworkLoader {
   uiEventsFramework: {
     initialize(applicationName: string, version?: string): Promise<McaUiEventsFrameworkProvider>;
@@ -267,7 +188,6 @@ export interface McaUiEventsFrameworkLoader {
 
 declare global {
   interface Window {
-    svcMca?: { tlb: McaToolbarApi };
     /** Confirmed global name — read directly from the loader script's own source. */
     CX_SVC_UI_EVENTS_FRAMEWORK?: McaUiEventsFrameworkLoader;
   }
