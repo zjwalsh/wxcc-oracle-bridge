@@ -36,7 +36,7 @@ export const MCA_CHANNEL_TYPE = "ORA_SVC_PHONE";
  * vs B2B Service) — verify this matches your org's configuration if
  * events aren't showing up as expected.
  */
-export const MCA_APP_CLASSIFICATION = "ORA_SERVICE";
+export const MCA_APP_CLASSIFICATION = "ORA_SALES";
 
 /** InData attribute keys — see file header re: which are confirmed. */
 export const MCA_ATTR = {
@@ -51,6 +51,16 @@ export const MCA_ATTR = {
   CONTACT_NUMBER: "SVCMCA_CONTACT_NUMBER", // confirmed: docs' response example
   PARENT_INTERACTION_ID: "SVCMCA_PARENT_INTERACTION_ID", // confirmed: docs, transfer scenarios
   COMMUNICATION_DIRECTION: "SVCMCA_COMMUNICATION_DIRECTION", // UNVERIFIED
+  // Confirmed live: present on onOutgoingEvent's payload for an
+  // agent-initiated outbound call (clicking a contact's phone number).
+  // Not currently echoed back on newCommEvent's ack — suspected cause of
+  // Oracle popping the contact screen then closing it and falling back to
+  // the service screen, since nothing ties the ack back to that contact.
+  CONTACT_ID: "SVCMCA_CONTACT_ID",
+  // Oracle's own call id, sent on onOutgoingEvent; echoed back on both
+  // newCommEvent and startCommEvent for agent-initiated outbound calls.
+  CALL_ID: "SVCMCA_CALL_ID",
+  INTERACTION_REF_OBJ_TYPE: "SVCMCA_INTERACTION_REF_OBJ_TYPE",
 } as const;
 
 /** This widget only ever offers inbound calls to newCommEvent. */

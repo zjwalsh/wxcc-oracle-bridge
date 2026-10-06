@@ -1,5 +1,5 @@
 import type { McaAgentCommand, McaInteractionCommand, McaResult, McaUiEventsFrameworkProvider, McaPhoneContext } from "../types/oracle-mca";
-import { MCA_APP_CLASSIFICATION, MCA_ATTR, MCA_CHANNEL, MCA_DIRECTION_OUTBOUND } from "../types/oracle-mca";
+import { MCA_APP_CLASSIFICATION, MCA_CHANNEL } from "../types/oracle-mca";
 import { log, errInfo } from "./logger";
 
 // Oracle's UI Events Framework loader — a fixed, generic entry point (not
@@ -48,7 +48,10 @@ function buildRequest(
 ): unknown {
   const request = callMethod(requestHelper, "createPublishRequest", operationName);
   if (opts.eventId !== undefined) callMethod(request, "setEventId", opts.eventId);
-  if (opts.appClassification !== undefined) callMethod(request, "setAppClassification", opts.appClassification);
+  if (opts.appClassification !== undefined) {
+    log.info(`${operationName}: calling setAppClassification`, { appClassification: opts.appClassification });
+    callMethod(request, "setAppClassification", opts.appClassification);
+  }
   if (opts.reason !== undefined) callMethod(request, "setReason", opts.reason);
   if (opts.inData) {
     const inDataBuilder = callMethod(request, "getInData");
@@ -61,11 +64,31 @@ function buildRequest(
   return request;
 }
 
-/** Reads the plain-object payload out of a publish() response — response.getResponseData().getData(), per fuief docs. */
-function extractResponseData(response: unknown): unknown {
+/**
+ * Reads the actual payload object out of a publish() response — fuief docs
+ * say response.getResponseData().getData(), but confirmed live in this org's
+ * deployment, publish() responses are plain objects with no such methods
+ * (callMethod logs "not found" and falls through) — the real shape is
+ * response.responseDetails.data.payload, with the documented outData nested
+ * one level further inside that as payload.outData. Without drilling all the
+ * way to payload.outData, the caller ends up merging Oracle's whole response
+ * wrapper (result/method/origin/toolbarName/uuid/eventSource/actions/etc.)
+ * into the next call's inData instead of just the documented correlation
+ * fields.
+ */
+function getResponsePayload(response: unknown): Record<string, unknown> | undefined {
   const responseData = callMethod(response, "getResponseData");
-  const data = callMethod(responseData, "getData");
-  return data ?? responseData ?? response;
+  const viaMethod = callMethod(responseData, "getData");
+  if (viaMethod !== undefined) return viaMethod as Record<string, unknown>;
+  if (responseData !== undefined) return responseData as Record<string, unknown>;
+  const record = response as { responseDetails?: { data?: { payload?: Record<string, unknown> } } } | undefined;
+  return record?.responseDetails?.data?.payload;
+}
+
+function extractResponseData(response: unknown): unknown {
+  const payload = getResponsePayload(response);
+  const outData = payload?.outData;
+  return outData ?? payload ?? response;
 }
 
 /**
@@ -324,50 +347,81 @@ class OracleMcaService {
     log.info(`← Webex: ${eventName}`, detail);
   }
 
-  async newCommEvent(eventId: string, inData: Record<string, string>): Promise<void> {
+  /**
+   * Returns the eventId that startCommEvent/closeCommEvent must use for this
+   * call. Normally that's just the eventId passed in (echoed back), but
+   * Oracle's response is the authoritative source per its documented
+   * contract (see pendingOutData) — if it comes back with a different one,
+   * that's what has to be used or Oracle can't correlate the later calls
+   * back to this ring notification.
+   */
+  async newCommEvent(eventId: string, inData: Record<string, string>): Promise<string> {
     if (!this.phoneContext || !this.provider) {
       log.warn("newCommEvent: UI Events Framework not ready — skipping", { eventId });
-      return;
+      return eventId;
     }
 
-    // Per Oracle's newCommEvent doc, callStatus is only ever shown set to
-    // "INCOMING" (and is optional even there). Its outbound-call sample
-    // (handle-outbound-calls.html) doesn't set callStatus at all — so it's
-    // omitted for outbound rather than guessing at an "OUTGOING"/"DIALING"
-    // value Oracle's docs never mention.
-    const isOutbound = inData[MCA_ATTR.COMMUNICATION_DIRECTION] === MCA_DIRECTION_OUTBOUND;
-    const fullInData = { ...(isOutbound ? {} : { callStatus: "INCOMING" }), ...inData };
-    log.info("→ Oracle: newCommEvent", { eventId, inData: fullInData });
+    // callStatus is left out here rather than guessed — Oracle's docs only
+    // ever show it as "INCOMING" (and optional even there), with no
+    // documented value for outbound at all. No source for the real status,
+    // so this passes inData through as-is instead of hardcoding one.
+    log.info("→ Oracle: newCommEvent", { eventId, appClassification: MCA_APP_CLASSIFICATION, inData });
 
     const request = buildRequest(this.provider.requestHelper, "newCommEvent", {
       eventId,
       appClassification: MCA_APP_CLASSIFICATION,
-      inData: fullInData,
+      inData,
     });
     try {
       const response = await this.phoneContext.publish(request);
       log.info("newCommEvent response", response);
+      const payload = getResponsePayload(response);
+      const resolvedEventId = ((callMethod(response, "getEventId") ?? payload?.eventId) as string | undefined) ?? eventId;
+      if (resolvedEventId !== eventId) {
+        log.info("newCommEvent: response returned a different eventId — using it for startCommEvent/closeCommEvent", {
+          sent: eventId,
+          resolved: resolvedEventId,
+        });
+      }
       const data = extractResponseData(response) as Record<string, string> | undefined;
       if (data) {
-        log.info("newCommEvent: storing response data to forward into startCommEvent/closeCommEvent", { eventId, data });
-        this.pendingOutData.set(eventId, data);
+        log.info("newCommEvent: storing response data to forward into startCommEvent/closeCommEvent", { eventId: resolvedEventId, data });
+        this.pendingOutData.set(resolvedEventId, data);
       } else {
         log.warn(
           "newCommEvent: response has no data — startCommEvent/closeCommEvent will go out without it, " +
             "which Oracle's docs say they need to correlate back to this ring notification",
-          { eventId, response }
+          { eventId: resolvedEventId, response }
         );
       }
+      return resolvedEventId;
     } catch (err) {
       log.error("newCommEvent: publish failed", { eventId }, errInfo(err));
+      return eventId;
     }
   }
 
-  /** Merges in the data captured from newCommEvent's response, per Oracle's documented contract (see pendingOutData). */
+  /**
+   * Merges in the data captured from newCommEvent's response, per Oracle's
+   * documented contract (see pendingOutData).
+   *
+   * Oracle's own response echoes back a "callStatus" of "INCOMING"
+   * regardless of actual direction (see newCommEvent's comment above) — if
+   * that were allowed to win over our own direction-derived value (see
+   * toMcaInData's callStatus handling in WxCCService), an outbound call
+   * would show as INCOMING again from here on. So outData's callStatus is
+   * dropped; everything else from it still wins, per the documented
+   * contract.
+   */
   private withPendingOutData(eventId: string, inData: Record<string, string>): Record<string, string> {
     const outData = this.pendingOutData.get(eventId);
     this.pendingOutData.delete(eventId);
-    return outData ? { ...inData, ...outData } : inData;
+    if (!outData) return inData;
+    const filteredOutData = { ...outData };
+    for (const key of Object.keys(filteredOutData)) {
+      if (key.toLowerCase() === "callstatus") delete filteredOutData[key];
+    }
+    return { ...inData, ...filteredOutData };
   }
 
   async startCommEvent(eventId: string, inData: Record<string, string>): Promise<void> {
@@ -376,7 +430,7 @@ class OracleMcaService {
       return;
     }
     const fullInData = this.withPendingOutData(eventId, inData);
-    log.info("→ Oracle: startCommEvent", { eventId, inData: fullInData });
+    log.info("→ Oracle: startCommEvent", { eventId, appClassification: MCA_APP_CLASSIFICATION, inData: fullInData });
     const request = buildRequest(this.provider.requestHelper, "startCommEvent", {
       eventId,
       appClassification: MCA_APP_CLASSIFICATION,
@@ -396,7 +450,7 @@ class OracleMcaService {
       return;
     }
     const fullInData = this.withPendingOutData(eventId, inData);
-    log.info("→ Oracle: closeCommEvent", { eventId, inData: fullInData, reason });
+    log.info("→ Oracle: closeCommEvent", { eventId, appClassification: MCA_APP_CLASSIFICATION, inData: fullInData, reason });
     const request = buildRequest(this.provider.requestHelper, "closeCommEvent", {
       eventId,
       appClassification: MCA_APP_CLASSIFICATION,
@@ -538,7 +592,11 @@ class OracleMcaService {
       reasonDisplayString,
       inData,
     });
-    const request = buildRequest(this.provider.requestHelper, "agentStateEvent", { eventId, inData });
+    const request = buildRequest(this.provider.requestHelper, "agentStateEvent", {
+      eventId,
+      appClassification: MCA_APP_CLASSIFICATION,
+      inData,
+    });
     callMethod(request, "setIsAvailable", isAvailable);
     callMethod(request, "setIsLoggedIn", isLoggedIn);
     callMethod(request, "setStateCd", stateCd);

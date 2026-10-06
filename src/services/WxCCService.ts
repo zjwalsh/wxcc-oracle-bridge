@@ -32,6 +32,8 @@ export interface ActiveCall {
    * subsequent call, per its onOutgoingEvent doc sample.
    */
   oracleEventId: string;
+  /** Oracle's SVCMCA_CALL_ID from onOutgoingEvent; only set for Oracle-initiated outbound calls. */
+  oracleCallId?: string;
   ani: string;
   dnis: string;
   queueName: string;
@@ -137,7 +139,13 @@ function stripLeadingPlus(ani: string): string {
  * plausible nesting spots and logs the raw payload above so a wrong guess
  * here is visible rather than silently dropping every outbound call.
  */
-function extractOutboundCallInfo(payload: unknown): { callId: string; ani: string; displayName: string } {
+function extractOutboundCallInfo(payload: unknown): {
+  callId: string;
+  ani: string;
+  displayName: string;
+  contactId: string;
+  interactionRefObjType: string;
+} {
   const p = payload as Record<string, unknown> | null | undefined;
   const candidates: Array<Record<string, unknown> | undefined> = [
     p ?? undefined,
@@ -161,6 +169,11 @@ function extractOutboundCallInfo(payload: unknown): { callId: string; ani: strin
     callId: pick(["SVCMCA_CALL_ID", "callId", "eventId"]),
     ani: pick(["SVCMCA_ANI", "ani"]),
     displayName: pick(["SVCMCA_DISPLAY_NAME", "displayName"]),
+    // Confirmed live on the UI Events Framework's onOutgoingEvent payload —
+    // see MCA_ATTR.CONTACT_ID's comment for why these are forwarded back on
+    // newCommEvent below.
+    contactId: pick([MCA_ATTR.CONTACT_ID, "contactId"]),
+    interactionRefObjType: pick([MCA_ATTR.INTERACTION_REF_OBJ_TYPE, "interactionRefObjType"]),
   };
 }
 
@@ -257,6 +270,19 @@ function toMcaInData(info: ContactInfo | ActiveCall, forNewCommEvent = false): R
       key.toLowerCase() === "ani" ? [key, stripLeadingPlus(value)] : [key, value]
     )
   );
+  // The flow's "callStatus" CAD variable is a stale literal ("INCOMING")
+  // that doesn't track the actual call direction — e.g. it still reads
+  // INCOMING on an outbound call. Rather than forward that stale value,
+  // make it track the flow's own "callDirection" CAD variable (blank if
+  // that's missing too).
+  const callStatusKey = Object.keys(callData).find((key) => key.toLowerCase() === "callstatus");
+  const callDirectionKey = Object.keys(callData).find((key) => key.toLowerCase() === "calldirection");
+  if (callStatusKey) {
+    callData[callStatusKey] = callDirectionKey ? callData[callDirectionKey] : "";
+  }
+  if ("oracleCallId" in info && info.oracleCallId) {
+    inData[MCA_ATTR.CALL_ID] = info.oracleCallId;
+  }
   return { ...callData, ...inData };
 }
 
@@ -326,12 +352,22 @@ class WxCCService {
   // ─── WxCC → Oracle ────────────────────────────────────────────────────────
 
   private registerWxCCEvents(): void {
-    const handleOfferContact = (source: string, detail: unknown) => {
+    const handleOfferContact = async (source: string, detail: unknown) => {
       log.debug(`${source} raw payload`, detail);
       oracleMca.logWebexEvent(source, detail);
       const info = extractContactInfo(detail);
       if (!info.interactionId) {
         log.warn(`${source}: no interactionId in payload — cannot offer contact`, detail);
+        return;
+      }
+      // This widget only ever offers inbound calls to newCommEvent (see
+      // MCA_DIRECTION_INBOUND's doc comment) — an outbound call is either
+      // already tracked via registerOutboundCallHandler's own newCommEvent
+      // (Oracle-initiated outdial) or wasn't placed through Oracle at all,
+      // so sending newCommEvent here would make Oracle treat it as a brand
+      // new inbound contact being offered.
+      if (info.direction === "OUTBOUND") {
+        log.debug(`${source}: outbound contact — not sending newCommEvent`, info);
         return;
       }
       // Multiple offer-shaped events (eAgentOfferContact, eAgentOfferConsult,
@@ -356,7 +392,13 @@ class WxCCService {
       // newCommEvent is Oracle's mandatory first call on call start / offer.
       // eventId = WxCC interactionId, consistently, so inbound commands
       // (which echo eventId back) can be correlated to the right call.
-      oracleMca.newCommEvent(info.interactionId, toMcaInData(info, true));
+      const oracleEventId = await oracleMca.newCommEvent(info.interactionId, toMcaInData(info, true));
+      // startCommEvent/closeCommEvent must use whatever eventId Oracle's
+      // response actually returned — only apply it if this is still the
+      // same call (not superseded while the request was in flight).
+      if (this.activeCall?.interactionId === info.interactionId) {
+        this.activeCall = { ...this.activeCall, oracleEventId };
+      }
       this.notify("incoming");
     };
 
@@ -385,7 +427,7 @@ class WxCCService {
     // logged which one actually fired either way, and connectContact() is
     // idempotent (state check) so it's harmless if both end up firing for
     // the same call.
-    const connectContact = (source: string, detail: unknown) => {
+    const connectContact = async (source: string, detail: unknown) => {
       log.debug(`${source} raw payload`, detail);
       oracleMca.logWebexEvent(source, detail);
       const info = extractContactInfo(detail);
@@ -408,8 +450,19 @@ class WxCCService {
           startedAt: new Date(),
           state: "incoming",
         };
-        log.info(`${source}: call started without preceding offer — sending newCommEvent`, this.activeCall);
-        oracleMca.newCommEvent(interactionId, toMcaInData(this.activeCall, true));
+        // This widget only ever offers inbound calls to newCommEvent — an
+        // outbound call reaching here was placed without Oracle's
+        // involvement, so there's nothing to tell Oracle (it never initiated
+        // or was told about this call).
+        if (info.direction === "OUTBOUND") {
+          log.debug(`${source}: outbound call connected without Oracle involvement — not sending newCommEvent`, this.activeCall);
+        } else {
+          log.info(`${source}: call started without preceding offer — sending newCommEvent`, this.activeCall);
+          const oracleEventId = await oracleMca.newCommEvent(interactionId, toMcaInData(this.activeCall, true));
+          if (this.activeCall?.interactionId === interactionId) {
+            this.activeCall = { ...this.activeCall, oracleEventId };
+          }
+        }
       }
       if (this.activeCall.state === "connected") {
         log.debug(`${source}: already connected — ignoring (likely another connect-signal event also firing for the same call)`);
@@ -900,7 +953,7 @@ class WxCCService {
    */
   private registerOutboundCallHandler(): void {
     oracleMca.onOutgoingCall(async (payload) => {
-      const { callId, ani, displayName } = extractOutboundCallInfo(payload);
+      const { callId, ani, displayName, contactId, interactionRefObjType } = extractOutboundCallInfo(payload);
       if (!callId || !ani) {
         log.warn("onOutgoingEvent: missing call id or ANI in payload — cannot place outbound call", payload);
         return;
@@ -919,6 +972,7 @@ class WxCCService {
       this.activeCall = {
         interactionId: callId,
         oracleEventId: callId,
+        oracleCallId: callId,
         ani,
         dnis: "",
         queueName: "",
@@ -927,11 +981,23 @@ class WxCCService {
         startedAt: new Date(),
         state: "incoming",
       };
-      log.info("onOutgoingEvent: acknowledging outbound call to Oracle", { callId, ani, displayName });
+      log.info("onOutgoingEvent: acknowledging outbound call to Oracle", { callId, ani, displayName, contactId, interactionRefObjType });
+      // Not using newCommEvent's resolved eventId here (unlike the inbound
+      // paths below) — per its doc sample, Oracle expects callId echoed back
+      // unchanged on every subsequent call for an agent-initiated outbound,
+      // and the pendingOutdial/oracleEventId identity checks below depend on
+      // that staying exactly callId.
       oracleMca.newCommEvent(callId, {
         [MCA_ATTR.ANI]: stripLeadingPlus(ani),
         [MCA_ATTR.COMMUNICATION_DIRECTION]: MCA_DIRECTION_OUTBOUND,
         channel: MCA_CHANNEL,
+        [MCA_ATTR.CALL_ID]: callId,
+        // Echoed back from onOutgoingEvent's own payload — suspected
+        // necessary for Oracle to keep the contact screen it already popped
+        // tied to this interaction instead of closing it and falling back
+        // to the service screen. See MCA_ATTR.CONTACT_ID's comment.
+        ...(contactId ? { [MCA_ATTR.CONTACT_ID]: contactId } : {}),
+        ...(interactionRefObjType ? { [MCA_ATTR.INTERACTION_REF_OBJ_TYPE]: interactionRefObjType } : {}),
       });
 
       // Tracked so registerOracleCommands can await it before dispatching a
